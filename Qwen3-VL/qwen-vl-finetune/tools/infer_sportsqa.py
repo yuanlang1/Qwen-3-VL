@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
 import torch
+from qwen_vl_utils import process_vision_info
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
 
@@ -30,9 +31,6 @@ def configure_video_processor(processor: Any, args: argparse.Namespace) -> None:
     if video_processor is None:
         return
     for attribute, value in (
-        ("fps", args.video_fps),
-        ("min_frames", args.video_min_frames),
-        ("max_frames", args.video_max_frames),
         ("min_pixels", args.video_min_pixels),
         ("max_pixels", args.video_max_pixels),
     ):
@@ -50,7 +48,9 @@ def resolve_video_path(video_root: Path, record: Dict[str, Any]) -> Path:
     return path if path.is_absolute() else video_root / path
 
 
-def build_messages(records: Iterable[Dict[str, Any]], video_root: Path) -> List[List[Dict[str, Any]]]:
+def build_messages(
+    records: Iterable[Dict[str, Any]], video_root: Path, args: argparse.Namespace
+) -> List[List[Dict[str, Any]]]:
     conversations = []
     for record in records:
         video_path = resolve_video_path(video_root, record)
@@ -65,7 +65,13 @@ def build_messages(records: Iterable[Dict[str, Any]], video_root: Path) -> List[
                 {
                     "role": "user",
                     "content": [
-                        {"type": "video", "video": str(video_path)},
+                        {
+                            "type": "video",
+                            "video": str(video_path),
+                            "nframes": args.video_frames,
+                            "min_pixels": args.video_min_pixels,
+                            "max_pixels": args.video_max_pixels,
+                        },
                         {"type": "text", "text": prompt},
                     ],
                 }
@@ -93,14 +99,55 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--attn-implementation")
-    parser.add_argument("--video-fps", type=float, default=2.0)
-    parser.add_argument("--video-min-frames", type=int, default=8)
-    parser.add_argument("--video-max-frames", type=int, default=16)
+    parser.add_argument("--video-frames", type=int, default=8)
     parser.add_argument("--video-min-pixels", type=int, default=200704)
     parser.add_argument("--video-max-pixels", type=int, default=802816)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
+
+
+def validate_video_args(args: argparse.Namespace) -> None:
+    if args.video_frames < 2:
+        raise ValueError("--video-frames must be at least 2")
+    if args.video_frames % 2:
+        raise ValueError("--video-frames must be even")
+    if args.video_min_pixels < 1 or args.video_max_pixels < args.video_min_pixels:
+        raise ValueError("Video pixel limits must satisfy 1 <= min_pixels <= max_pixels")
+
+
+def prepare_inputs(processor: Any, model_type: str, messages: List[List[Dict[str, Any]]]) -> Any:
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    if model_type == "qwen3_vl":
+        images, videos, video_kwargs = process_vision_info(
+            messages,
+            image_patch_size=16,
+            return_video_kwargs=True,
+            return_video_metadata=True,
+        )
+        video_metadata = None
+        if videos is not None:
+            videos, video_metadata = zip(*videos)
+            videos, video_metadata = list(videos), list(video_metadata)
+        return processor(
+            text=text,
+            images=images,
+            videos=videos,
+            video_metadata=video_metadata,
+            padding=True,
+            return_tensors="pt",
+            **video_kwargs,
+        )
+
+    images, videos, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
+    return processor(
+        text=text,
+        images=images,
+        videos=videos,
+        padding=True,
+        return_tensors="pt",
+        **video_kwargs,
+    )
 
 
 def main() -> None:
@@ -109,6 +156,7 @@ def main() -> None:
         raise ValueError("--batch-size must be at least 1")
     if args.temperature < 0:
         raise ValueError("--temperature cannot be negative")
+    validate_video_args(args)
 
     records = load_json(args.manifest)
     if not isinstance(records, list):
@@ -131,18 +179,30 @@ def main() -> None:
 
         model = PeftModel.from_pretrained(model, str(args.adapter_path))
     model.eval()
+    print(f"Video sampling: model_type={model.config.model_type}, frames={args.video_frames}")
 
     args.output_file.parent.mkdir(parents=True, exist_ok=True)
     mode = "a" if args.resume else "w"
     with args.output_file.open(mode, encoding="utf-8") as output_handle:
         for batch_index, batch_records in enumerate(chunks(records, args.batch_size), start=1):
-            messages = build_messages(batch_records, args.video_root)
-            inputs = processor.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=True,
-                return_tensors="pt",
+            messages = build_messages(batch_records, args.video_root, args)
+            inputs = prepare_inputs(processor, model.config.model_type, messages)
+            input_token_count = inputs.input_ids.shape[-1]
+            max_context = getattr(model.config, "max_position_embeddings", None)
+            if max_context is None:
+                max_context = getattr(
+                    getattr(model.config, "text_config", None), "max_position_embeddings", None
+                )
+            if max_context is not None and input_token_count + args.max_new_tokens > max_context:
+                raise RuntimeError(
+                    "Video preprocessing produced "
+                    f"{input_token_count} input tokens, which leaves insufficient context for "
+                    f"{args.max_new_tokens} generated tokens (model limit: {max_context}). "
+                    "Reduce --video-frames or --video-max-pixels."
+                )
+            print(
+                f"Batch {batch_index}: {input_token_count} input tokens; "
+                f"{args.video_frames} frames per video."
             )
             inputs = inputs.to(model.device)
             generation_kwargs: Dict[str, Any] = {

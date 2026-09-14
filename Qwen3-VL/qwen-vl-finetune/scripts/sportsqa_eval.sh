@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -e
+
 # Sports-QA paths: replace these placeholders before running on the server.
 prepared_root=PATH_TO_SPORTSQA_PREPARED_ROOT
 video_root=PATH_TO_SPORTSQA_VIDEO_ROOT
@@ -9,11 +11,9 @@ answer_map=${prepared_root}/answer_to_id.json
 # Evaluation hyperparameters
 batch_size=1
 max_new_tokens=32
-video_fps=2
-video_min_frames=8
-video_max_frames=16
-video_min_pixels=200704
-video_max_pixels=802816
+video_frames=8
+video_min_pixels=50176
+video_max_pixels=200704
 max_samples=0
 
 # Model configuration
@@ -43,9 +43,7 @@ infer_args="
     --batch-size ${batch_size} \
     --max-new-tokens ${max_new_tokens} \
     --temperature 0 \
-    --video-fps ${video_fps} \
-    --video-min-frames ${video_min_frames} \
-    --video-max-frames ${video_max_frames} \
+    --video-frames ${video_frames} \
     --video-min-pixels ${video_min_pixels} \
     --video-max-pixels ${video_max_pixels}"
 

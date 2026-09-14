@@ -48,8 +48,10 @@ ID to a path relative to `/data/sportsqa/videos`.
 
 ## 3. Validation-only zero-shot baselines
 
-First edit the frame settings at the top of `scripts/sportsqa_eval.sh`. Keep the
-same setting for all three models, and evaluate on `val` only while choosing it.
+First edit `video_frames`, `video_min_pixels`, and `video_max_pixels` at the
+top of `scripts/sportsqa_eval.sh`. Keep the same setting for all three models,
+and evaluate on `val` only while choosing it. Start the smoke test with
+`video_frames=8`, `video_min_pixels=50176`, and `video_max_pixels=200704`.
 
 ```bash
 bash scripts/sportsqa_eval.sh Qwen/Qwen2.5-VL-3B-Instruct sportsqa-qwen25vl-3b
