@@ -1,0 +1,184 @@
+"""Run deterministic Qwen-VL inference on a prepared Sports-QA manifest."""
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any, Dict, Iterable, List
+
+import torch
+from transformers import AutoModelForImageTextToText, AutoProcessor
+
+
+def load_json(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def read_completed_ids(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    completed = set()
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                completed.add(str(json.loads(line)["qa_id"]))
+    return completed
+
+
+def configure_video_processor(processor: Any, args: argparse.Namespace) -> None:
+    video_processor = getattr(processor, "video_processor", None)
+    if video_processor is None:
+        return
+    for attribute, value in (
+        ("fps", args.video_fps),
+        ("min_frames", args.video_min_frames),
+        ("max_frames", args.video_max_frames),
+        ("min_pixels", args.video_min_pixels),
+        ("max_pixels", args.video_max_pixels),
+    ):
+        if value is not None and hasattr(video_processor, attribute):
+            setattr(video_processor, attribute, value)
+    if hasattr(video_processor, "size") and isinstance(video_processor.size, dict):
+        if args.video_min_pixels is not None:
+            video_processor.size["shortest_edge"] = args.video_min_pixels
+        if args.video_max_pixels is not None:
+            video_processor.size["longest_edge"] = args.video_max_pixels
+
+
+def resolve_video_path(video_root: Path, record: Dict[str, Any]) -> Path:
+    path = Path(str(record["video"]))
+    return path if path.is_absolute() else video_root / path
+
+
+def build_messages(records: Iterable[Dict[str, Any]], video_root: Path) -> List[List[Dict[str, Any]]]:
+    conversations = []
+    for record in records:
+        video_path = resolve_video_path(video_root, record)
+        if not video_path.is_file():
+            raise FileNotFoundError(f"Missing video for qa_id={record['qa_id']}: {video_path}")
+        prompt = (
+            f"Question: {str(record['question']).strip()}\n"
+            "Answer with only the final answer."
+        )
+        conversations.append(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "video", "video": str(video_path)},
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ]
+        )
+    return conversations
+
+
+def chunks(records: List[Dict[str, Any]], batch_size: int) -> Iterable[List[Dict[str, Any]]]:
+    for index in range(0, len(records), batch_size):
+        yield records[index : index + batch_size]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model-name-or-path", required=True)
+    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--video-root", type=Path, required=True)
+    parser.add_argument("--output-file", type=Path, required=True)
+    parser.add_argument("--adapter-path", type=Path)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--dtype", default="auto")
+    parser.add_argument("--device-map", default="auto")
+    parser.add_argument("--attn-implementation")
+    parser.add_argument("--video-fps", type=float, default=2.0)
+    parser.add_argument("--video-min-frames", type=int, default=8)
+    parser.add_argument("--video-max-frames", type=int, default=16)
+    parser.add_argument("--video-min-pixels", type=int, default=200704)
+    parser.add_argument("--video-max-pixels", type=int, default=802816)
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--resume", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be at least 1")
+    if args.temperature < 0:
+        raise ValueError("--temperature cannot be negative")
+
+    records = load_json(args.manifest)
+    if not isinstance(records, list):
+        raise ValueError("--manifest must contain a JSON list")
+    completed_ids = read_completed_ids(args.output_file) if args.resume else set()
+    records = [record for record in records if str(record["qa_id"]) not in completed_ids]
+    if args.limit is not None:
+        records = records[: args.limit]
+
+    # Intermediate LoRA checkpoints do not necessarily contain a processor.
+    # The processor must match the immutable base model in every comparison.
+    processor = AutoProcessor.from_pretrained(args.model_name_or_path)
+    configure_video_processor(processor, args)
+    model_kwargs: Dict[str, Any] = {"dtype": args.dtype, "device_map": args.device_map}
+    if args.attn_implementation:
+        model_kwargs["attn_implementation"] = args.attn_implementation
+    model = AutoModelForImageTextToText.from_pretrained(args.model_name_or_path, **model_kwargs)
+    if args.adapter_path:
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(model, str(args.adapter_path))
+    model.eval()
+
+    args.output_file.parent.mkdir(parents=True, exist_ok=True)
+    mode = "a" if args.resume else "w"
+    with args.output_file.open(mode, encoding="utf-8") as output_handle:
+        for batch_index, batch_records in enumerate(chunks(records, args.batch_size), start=1):
+            messages = build_messages(batch_records, args.video_root)
+            inputs = processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
+            inputs = inputs.to(model.device)
+            generation_kwargs: Dict[str, Any] = {
+                "max_new_tokens": args.max_new_tokens,
+                "do_sample": args.temperature > 0,
+            }
+            if args.temperature > 0:
+                generation_kwargs.update({"temperature": args.temperature, "top_p": args.top_p})
+            with torch.inference_mode():
+                generated_ids = model.generate(**inputs, **generation_kwargs)
+            trimmed_ids = [
+                output_ids[len(input_ids) :]
+                for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
+            ]
+            predictions = processor.batch_decode(
+                trimmed_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+            for record, prediction in zip(batch_records, predictions):
+                result = {
+                    "qa_id": record["qa_id"],
+                    "video_id": record["video_id"],
+                    "type": record["type"],
+                    "sport": record["sport"],
+                    "question": record["question"],
+                    "answer": record["answer"],
+                    "ans_cls": record["ans_cls"],
+                    "prediction_raw": prediction,
+                    "model_name_or_path": args.model_name_or_path,
+                    "adapter_path": str(args.adapter_path) if args.adapter_path else None,
+                }
+                output_handle.write(json.dumps(result, ensure_ascii=False) + "\n")
+            output_handle.flush()
+            print(f"Completed batch {batch_index}; predictions written: {batch_index * args.batch_size}")
+
+
+if __name__ == "__main__":
+    main()
