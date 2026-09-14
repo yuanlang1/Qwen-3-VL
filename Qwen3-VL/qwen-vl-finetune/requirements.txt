@@ -1,0 +1,23 @@
+# Sports-QA Qwen-VL environment
+# Target: Ubuntu 22.04, Python 3.12, PyTorch 2.8.0 and CUDA 12.8.
+# The supplied server image already contains the matching PyTorch build.
+
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+torch==2.8.0+cu128
+torchvision==0.23.0+cu128
+transformers==4.57.0
+accelerate==1.7.0
+deepspeed==0.18.6
+peft==0.17.1
+torchcodec==0.7.0
+qwen-vl-utils==0.0.14
+numpy==1.26.4
+einops==0.8.1
+packaging>=24.0
+psutil>=6.0
+ninja>=1.11.1
+
+# Install separately after this file, with:
+# pip install --no-build-isolation flash-attn==2.8.3
+# FlashAttention is required by qwenvl/train/train_qwen.py for SFT.
