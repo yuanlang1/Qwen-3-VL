@@ -1,0 +1,15 @@
+flowchart TD
+    A["Prepared Sports-QA test manifest<br/>videos and answer map"] --> B["run_table10_qwen.sh<br/>fixed Yang 0S and temperature 0"]
+    B --> C["Qwen inference<br/>video plus original question"]
+    C --> D["run-name directory<br/>predictions/test_yang-0s.jsonl"]
+
+    D --> E["Exact evaluator<br/>191-class canonical match"]
+    E --> F["metrics/test_yang-0s_exact.json<br/>Accuracy, Macro-F1, diagnostics"]
+
+    D --> G["Semantic judge<br/>question + reference + prediction<br/>DeepSeek-V3, no video"]
+    H["SILICONFLOW_API_KEY<br/>process environment only"] --> G
+    G --> I["judgments/test_yang-0s_deepseek-v3.jsonl<br/>match, 0-5 score, reason, raw response"]
+    I --> J["Semantic summarizer"]
+    J --> K["metrics/test_yang-0s_deepseek-v3.json<br/>Table 10-style Accuracy by type and overall"]
+
+    L["Validation split<br/>only for tuned LoRA/checkpoint or sampling selection"] -. "never used to report final result" .-> B

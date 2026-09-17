@@ -2,11 +2,13 @@
 
 import argparse
 import json
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Tuple
 
 import torch
 from qwen_vl_utils import process_vision_info
+from tqdm.auto import tqdm
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
 
@@ -48,30 +50,46 @@ def resolve_video_path(video_root: Path, record: Dict[str, Any]) -> Path:
     return path if path.is_absolute() else video_root / path
 
 
-def build_messages(
-    records: Iterable[Dict[str, Any]], video_root: Path, args: argparse.Namespace
-) -> List[List[Dict[str, Any]]]:
-    conversations = []
+def group_records_by_video(
+    records: Iterable[Dict[str, Any]], video_root: Path
+) -> List[Tuple[Path, List[Dict[str, Any]]]]:
+    groups: Dict[Path, List[Dict[str, Any]]] = {}
     for record in records:
         video_path = resolve_video_path(video_root, record)
         if not video_path.is_file():
             raise FileNotFoundError(f"Missing video for qa_id={record['qa_id']}: {video_path}")
-        prompt = (
-            f"Question: {str(record['question']).strip()}\n"
-            "Answer with only the final answer."
-        )
+        groups.setdefault(video_path, []).append(record)
+    return list(groups.items())
+
+
+def build_video_content(video_path: Path, args: argparse.Namespace) -> Dict[str, Any]:
+    return {
+        "type": "video",
+        "video": str(video_path),
+        "nframes": args.video_frames,
+        "min_pixels": args.video_min_pixels,
+        "max_pixels": args.video_max_pixels,
+    }
+
+
+def build_messages(
+    records: Iterable[Dict[str, Any]], video_content: Dict[str, Any], prompt_style: str
+) -> List[List[Dict[str, Any]]]:
+    conversations = []
+    for record in records:
+        question = str(record["question"]).strip()
+        if prompt_style == "current":
+            prompt = f"Question: {question}\nAnswer with only the final answer."
+        elif prompt_style == "yang-0s":
+            prompt = question
+        else:
+            prompt = f"Let's think step by step. {question}"
         conversations.append(
             [
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "video",
-                            "video": str(video_path),
-                            "nframes": args.video_frames,
-                            "min_pixels": args.video_min_pixels,
-                            "max_pixels": args.video_max_pixels,
-                        },
+                        dict(video_content),
                         {"type": "text", "text": prompt},
                     ],
                 }
@@ -102,6 +120,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-frames", type=int, default=8)
     parser.add_argument("--video-min-pixels", type=int, default=200704)
     parser.add_argument("--video-max-pixels", type=int, default=802816)
+    parser.add_argument(
+        "--prompt-style",
+        choices=("current", "yang-0s", "yang-cot"),
+        default="current",
+        help="Prompt protocol. current preserves the existing Sports-QA instruction.",
+    )
     parser.add_argument("--limit", type=int)
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
@@ -116,33 +140,67 @@ def validate_video_args(args: argparse.Namespace) -> None:
         raise ValueError("Video pixel limits must satisfy 1 <= min_pixels <= max_pixels")
 
 
-def prepare_inputs(processor: Any, model_type: str, messages: List[List[Dict[str, Any]]]) -> Any:
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+@dataclass
+class CachedVideo:
+    frames: Any
+    video_kwargs: Dict[str, Any]
+    metadata: Any = None
+
+
+def load_video_once(video_content: Dict[str, Any], model_type: str) -> CachedVideo:
+    conversation = [[{"role": "user", "content": [dict(video_content)]}]]
     if model_type == "qwen3_vl":
-        images, videos, video_kwargs = process_vision_info(
-            messages,
+        _, videos, video_kwargs = process_vision_info(
+            conversation,
             image_patch_size=16,
             return_video_kwargs=True,
             return_video_metadata=True,
         )
-        video_metadata = None
-        if videos is not None:
-            videos, video_metadata = zip(*videos)
-            videos, video_metadata = list(videos), list(video_metadata)
+        if videos is None or len(videos) != 1:
+            raise ValueError("Expected exactly one decoded video")
+        frames, metadata = videos[0]
+        return CachedVideo(frames=frames, video_kwargs=video_kwargs, metadata=metadata)
+
+    _, videos, video_kwargs = process_vision_info(conversation, return_video_kwargs=True)
+    if videos is None or len(videos) != 1:
+        raise ValueError("Expected exactly one decoded video")
+    return CachedVideo(frames=videos[0], video_kwargs=video_kwargs)
+
+
+def repeat_video_kwargs(video_kwargs: Dict[str, Any], batch_size: int) -> Dict[str, Any]:
+    repeated_kwargs = dict(video_kwargs)
+    fps = repeated_kwargs.get("fps")
+    if isinstance(fps, list):
+        if len(fps) != 1:
+            raise ValueError("Expected one sampled fps value for a cached video")
+        repeated_kwargs["fps"] = fps * batch_size
+    return repeated_kwargs
+
+
+def prepare_inputs_from_cached_video(
+    processor: Any,
+    model_type: str,
+    messages: List[List[Dict[str, Any]]],
+    cached_video: CachedVideo,
+) -> Any:
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    batch_size = len(messages)
+    videos = [cached_video.frames] * batch_size
+    video_kwargs = repeat_video_kwargs(cached_video.video_kwargs, batch_size)
+    if model_type == "qwen3_vl":
         return processor(
             text=text,
-            images=images,
+            images=None,
             videos=videos,
-            video_metadata=video_metadata,
+            video_metadata=[cached_video.metadata] * batch_size,
             padding=True,
             return_tensors="pt",
             **video_kwargs,
         )
 
-    images, videos, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
     return processor(
         text=text,
-        images=images,
+        images=None,
         videos=videos,
         padding=True,
         return_tensors="pt",
@@ -165,6 +223,10 @@ def main() -> None:
     records = [record for record in records if str(record["qa_id"]) not in completed_ids]
     if args.limit is not None:
         records = records[: args.limit]
+    if not records:
+        print("Sports-QA inference: no pending QAs; existing predictions are unchanged.")
+        return
+    video_groups = group_records_by_video(records, args.video_root)
 
     # Intermediate LoRA checkpoints do not necessarily contain a processor.
     # The processor must match the immutable base model in every comparison.
@@ -179,65 +241,76 @@ def main() -> None:
 
         model = PeftModel.from_pretrained(model, str(args.adapter_path))
     model.eval()
-    print(f"Video sampling: model_type={model.config.model_type}, frames={args.video_frames}")
+    print(
+        f"Video sampling: model_type={model.config.model_type}, frames={args.video_frames}; "
+        f"prompt_style={args.prompt_style}; {len(records)} QAs across {len(video_groups)} unique videos"
+    )
 
     args.output_file.parent.mkdir(parents=True, exist_ok=True)
     mode = "a" if args.resume else "w"
     with args.output_file.open(mode, encoding="utf-8") as output_handle:
-        for batch_index, batch_records in enumerate(chunks(records, args.batch_size), start=1):
-            messages = build_messages(batch_records, args.video_root, args)
-            inputs = prepare_inputs(processor, model.config.model_type, messages)
-            input_token_count = inputs.input_ids.shape[-1]
-            max_context = getattr(model.config, "max_position_embeddings", None)
-            if max_context is None:
-                max_context = getattr(
-                    getattr(model.config, "text_config", None), "max_position_embeddings", None
-                )
-            if max_context is not None and input_token_count + args.max_new_tokens > max_context:
-                raise RuntimeError(
-                    "Video preprocessing produced "
-                    f"{input_token_count} input tokens, which leaves insufficient context for "
-                    f"{args.max_new_tokens} generated tokens (model limit: {max_context}). "
-                    "Reduce --video-frames or --video-max-pixels."
-                )
-            print(
-                f"Batch {batch_index}: {input_token_count} input tokens; "
-                f"{args.video_frames} frames per video."
-            )
-            inputs = inputs.to(model.device)
-            generation_kwargs: Dict[str, Any] = {
-                "max_new_tokens": args.max_new_tokens,
-                "do_sample": args.temperature > 0,
-            }
-            if args.temperature > 0:
-                generation_kwargs.update({"temperature": args.temperature, "top_p": args.top_p})
-            with torch.inference_mode():
-                generated_ids = model.generate(**inputs, **generation_kwargs)
-            trimmed_ids = [
-                output_ids[len(input_ids) :]
-                for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            predictions = processor.batch_decode(
-                trimmed_ids,
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=False,
-            )
-            for record, prediction in zip(batch_records, predictions):
-                result = {
-                    "qa_id": record["qa_id"],
-                    "video_id": record["video_id"],
-                    "type": record["type"],
-                    "sport": record["sport"],
-                    "question": record["question"],
-                    "answer": record["answer"],
-                    "ans_cls": record["ans_cls"],
-                    "prediction_raw": prediction,
-                    "model_name_or_path": args.model_name_or_path,
-                    "adapter_path": str(args.adapter_path) if args.adapter_path else None,
-                }
-                output_handle.write(json.dumps(result, ensure_ascii=False) + "\n")
-            output_handle.flush()
-            print(f"Completed batch {batch_index}; predictions written: {batch_index * args.batch_size}")
+        with tqdm(total=len(records), desc="Sports-QA inference", unit="qa", dynamic_ncols=True) as progress:
+            for video_index, (video_path, video_records) in enumerate(video_groups, start=1):
+                video_content = build_video_content(video_path, args)
+                cached_video = load_video_once(video_content, model.config.model_type)
+                for batch_records in chunks(video_records, args.batch_size):
+                    messages = build_messages(batch_records, video_content, args.prompt_style)
+                    inputs = prepare_inputs_from_cached_video(
+                        processor, model.config.model_type, messages, cached_video
+                    )
+                    input_token_count = inputs.input_ids.shape[-1]
+                    max_context = getattr(model.config, "max_position_embeddings", None)
+                    if max_context is None:
+                        max_context = getattr(
+                            getattr(model.config, "text_config", None), "max_position_embeddings", None
+                        )
+                    if max_context is not None and input_token_count + args.max_new_tokens > max_context:
+                        raise RuntimeError(
+                            "Video preprocessing produced "
+                            f"{input_token_count} input tokens, which leaves insufficient context for "
+                            f"{args.max_new_tokens} generated tokens (model limit: {max_context}). "
+                            "Reduce --video-frames or --video-max-pixels."
+                        )
+                    inputs = inputs.to(model.device)
+                    generation_kwargs: Dict[str, Any] = {
+                        "max_new_tokens": args.max_new_tokens,
+                        "do_sample": args.temperature > 0,
+                    }
+                    if args.temperature > 0:
+                        generation_kwargs.update({"temperature": args.temperature, "top_p": args.top_p})
+                    with torch.inference_mode():
+                        generated_ids = model.generate(**inputs, **generation_kwargs)
+                    trimmed_ids = [
+                        output_ids[len(input_ids) :]
+                        for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
+                    ]
+                    predictions = processor.batch_decode(
+                        trimmed_ids,
+                        skip_special_tokens=True,
+                        clean_up_tokenization_spaces=False,
+                    )
+                    for record, prediction in zip(batch_records, predictions):
+                        result = {
+                            "qa_id": record["qa_id"],
+                            "video_id": record["video_id"],
+                            "type": record["type"],
+                            "sport": record["sport"],
+                            "question": record["question"],
+                            "answer": record["answer"],
+                            "ans_cls": record["ans_cls"],
+                            "prediction_raw": prediction,
+                            "model_name_or_path": args.model_name_or_path,
+                            "adapter_path": str(args.adapter_path) if args.adapter_path else None,
+                            "prompt_style": args.prompt_style,
+                        }
+                        output_handle.write(json.dumps(result, ensure_ascii=False) + "\n")
+                    output_handle.flush()
+                    progress.update(len(batch_records))
+                    progress.set_postfix(
+                        tokens=input_token_count,
+                        videos=f"{video_index}/{len(video_groups)}",
+                    )
+                del cached_video
 
 
 if __name__ == "__main__":

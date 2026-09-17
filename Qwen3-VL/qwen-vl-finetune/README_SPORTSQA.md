@@ -1,7 +1,9 @@
 # Sports-QA server workflow
 
 This workflow uses the official Sports-QA `train.json`, `val.json`, `test.json`,
-and `ans2cls.json`. It does not read `.env` files or shell environment variables.
+and `ans2cls.json`. Dataset and work paths are explicit placeholders rather than
+environment variables. The optional LLM-judge workflow reads only its API key from
+the process environment.
 
 ## 1. Replace the path placeholders
 
@@ -96,3 +98,13 @@ bash scripts/sportsqa_eval.sh \
 The metrics JSON contains overall Accuracy and Macro-F1 plus question-type and
 sport-category groups. The details JSONL preserves raw and normalized answers
 for error analysis.
+
+## 6. Table 10-style Qwen evaluation with an LLM judge
+
+The isolated Yang-style Qwen workflow is in
+[`tools/sportsqa-qwen-llm-judge`](tools/sportsqa-qwen-llm-judge/README.md), with its
+entry point at `scripts/sft-3b-llm-judge/run_table10_qwen.sh`. It fixes the split to
+`test`, uses the original question as the zero-shot prompt, preserves the existing
+exact-match report, and writes a separate semantic report judged by SiliconFlow
+DeepSeek-V3. The semantic score is protocol-comparable with Yang et al. but is not an
+exact historical reproduction because Yang et al. used GPT-4 as the judge.
