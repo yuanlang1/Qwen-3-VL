@@ -82,6 +82,8 @@ def main() -> None:
     failed_ids = []
     judge_models = set()
     prompt_versions = set()
+    judge_requested_batch_sizes = set()
+    judge_max_in_flight_batches = set()
     for item in manifest:
         qa_id = str(item["qa_id"])
         row = judgments.get(qa_id)
@@ -98,6 +100,10 @@ def main() -> None:
         successful_rows.append(row)
         judge_models.add(str(row.get("judge_model")))
         prompt_versions.add(str(row.get("judge_prompt_version")))
+        judge_requested_batch_sizes.add(
+            row.get("judge_requested_batch_size", row.get("batch_size"))
+        )
+        judge_max_in_flight_batches.add(row.get("judge_max_in_flight_batches", 1))
 
     incomplete_count = len(missing_ids) + len(failed_ids)
     if args.require_complete and incomplete_count:
@@ -110,6 +116,8 @@ def main() -> None:
             "name": "Yang-style semantic judge with a substitute LLM judge",
             "judge_models": sorted(judge_models),
             "judge_prompt_versions": sorted(prompt_versions),
+            "judge_requested_batch_sizes": sorted(judge_requested_batch_sizes),
+            "judge_max_in_flight_batches": sorted(judge_max_in_flight_batches),
         },
         "expected_count": len(manifest),
         "judged_count": len(successful_rows),

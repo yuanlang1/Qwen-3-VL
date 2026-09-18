@@ -47,6 +47,7 @@ judge_model=deepseek-ai/DeepSeek-V3
 judge_batch_size=100
 judge_max_tokens=8192
 judge_timeout_seconds=240
+judge_max_in_flight_batches=4
 
 model=$1
 run_name=$2
@@ -104,6 +105,7 @@ judge_args=(
     --max-tokens "${judge_max_tokens}"
     --batch-size "${judge_batch_size}"
     --timeout-seconds "${judge_timeout_seconds}"
+    --max-in-flight-batches "${judge_max_in_flight_batches}"
     --resume
 )
 if [ "${max_samples}" -gt 0 ]; then

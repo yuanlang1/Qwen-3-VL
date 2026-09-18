@@ -58,12 +58,15 @@ values. They are implementation choices, not claims about the original Qwen setu
 | `video_min_pixels` | `50176` (`224 x 224`) | Lower visual-resolution budget used by the Qwen video processor. It prevents very small frames from being reduced below the fixed evaluation profile. |
 | `video_max_pixels` | `200704` (`448 x 448`) | Upper visual-resolution budget used by the Qwen video processor. It limits visual tokens and GPU memory while retaining more detail than the lower bound. |
 | `judge_batch_size` | `100` | Number of independent QA judgments included in one DeepSeek request. It improves judge throughput; each returned QA is still parsed and stored independently. |
+| `judge_max_in_flight_batches` | `4` | At most four 100-QA judge requests are in flight at once. It reduces idle network time without changing the QA grouping or output file name. Start at `2` if the endpoint responds with rate-limit or timeout errors. |
 | `judge_max_tokens` | `8192` | Maximum generated tokens for the *whole DeepSeek batch response*, not for one QA. It leaves room for 100 JSON judgments and short reasons; `1024` is too tight for this batch format. |
 | `judge_timeout_seconds` | `240` | Maximum time to wait for one DeepSeek response. The judge defaults to 60 seconds, which can be too short for a large batch and trigger an unnecessary single-item fallback. |
 
-Changing any video or judge value changes the evaluation protocol. Use a new `run_name`
-and update `judge_label` when changing `judge_batch_size`, so artifacts from unlike
-protocols are never mixed.
+Changing a video value, judge model, prompt, or `judge_batch_size` changes the evaluation
+protocol. Use a new `run_name` and update `judge_label` when changing
+`judge_batch_size`, so artifacts from unlike protocols are never mixed.
+`judge_max_in_flight_batches` changes only request scheduling: it is recorded in the
+artifacts but can be adjusted while resuming the same evaluation.
 
 ## Outputs
 
@@ -75,10 +78,14 @@ Each run writes beneath `${output_root}/${run_name}/`:
 - `metrics/test_yang-0s_deepseek-v3-batch100.json`: semantic Overall Accuracy, four question-type
   accuracies, average semantic score, and coverage.
 
-The judge sends 100 independent QA items in one DeepSeek request by default. It requires
-exactly one JSON judgment for every requested `qa_id`; if a whole batch still fails after
-its retries, it automatically retries the items one by one. The JSONL remains one
-auditable record per QA and records its `batch_id`, `batch_size`, and `judge_mode`.
+The judge sends 100 independent QA items in one DeepSeek request by default, with up to
+four requests in flight. It requires exactly one JSON judgment for every requested
+`qa_id`; if a whole batch still fails after its retries, it automatically retries the
+items one by one inside the same worker. The JSONL remains one auditable record per QA
+and records its `batch_id`, actual `batch_size`, `judge_mode`, requested batch size, and
+the concurrent-request limit. Worker threads never write JSONL; the main thread writes
+and flushes only completed batches. Retries honor numeric `Retry-After` values when
+available; otherwise they use exponential backoff with a small random jitter.
 
 The runner enables `--resume` for both inference and semantic judging. Re-running the
 same command after an interruption preserves existing predictions, skips completed

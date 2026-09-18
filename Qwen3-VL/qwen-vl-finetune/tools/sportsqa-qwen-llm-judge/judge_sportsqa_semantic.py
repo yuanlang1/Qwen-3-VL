@@ -6,9 +6,11 @@ OpenAI-compatible judge endpoint. No API key is written to output files.
 """
 
 import argparse
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import hashlib
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -209,6 +211,21 @@ def error_message(error: Exception) -> str:
     return f"{type(error).__name__}: {error}"
 
 
+def retry_delay_seconds(error: Exception, attempt: int, args: argparse.Namespace) -> float:
+    if isinstance(error, HTTPError):
+        retry_after = error.headers.get("Retry-After") if error.headers else None
+        if retry_after is not None:
+            try:
+                return max(0.0, float(retry_after))
+            except ValueError:
+                pass
+    exponential_delay = min(
+        args.max_retry_backoff_seconds,
+        args.retry_backoff_seconds * (2 ** (attempt - 1)),
+    )
+    return exponential_delay + random.uniform(0.0, min(1.0, exponential_delay * 0.25))
+
+
 def common_row(
     item: Dict[str, Any],
     prediction: Dict[str, Any],
@@ -225,6 +242,8 @@ def common_row(
         "judge_model": args.model,
         "judge_endpoint": args.endpoint,
         "judge_prompt_version": PROMPT_VERSION,
+        "judge_requested_batch_size": args.batch_size,
+        "judge_max_in_flight_batches": args.max_in_flight_batches,
         "batch_id": batch_id,
         "judge_mode": judge_mode,
     }
@@ -316,7 +335,7 @@ def request_batch_with_retries(
         except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError) as error:
             last_error = error_message(error)
             if attempt < args.max_attempts:
-                time.sleep(args.retry_backoff_seconds * attempt)
+                time.sleep(retry_delay_seconds(error, attempt, args))
     return None, last_error
 
 
@@ -325,17 +344,11 @@ def judge_batch_with_fallback(
     args: argparse.Namespace,
     api_key: str,
     batch_id: int,
-    emit_rows: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
-    set_mode: Optional[Callable[[str], None]] = None,
 ) -> List[Dict[str, Any]]:
     rows, batch_error = request_batch_with_retries(items, args, api_key, batch_id, "batch")
     if rows is not None:
-        if emit_rows is not None:
-            emit_rows(rows)
         return rows
 
-    if set_mode is not None:
-        set_mode("fallback")
     fallback_rows = []
     for item, prediction in items:
         rows, single_error = request_batch_with_retries(
@@ -350,8 +363,6 @@ def judge_batch_with_fallback(
             row = rows[0]
             row["batch_error"] = batch_error
         fallback_rows.append(row)
-        if emit_rows is not None:
-            emit_rows([row])
     return fallback_rows
 
 
@@ -405,6 +416,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout-seconds", type=int, default=60)
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--retry-backoff-seconds", type=float, default=2.0)
+    parser.add_argument("--max-retry-backoff-seconds", type=float, default=60.0)
+    parser.add_argument(
+        "--max-in-flight-batches",
+        type=int,
+        default=1,
+        help="Maximum concurrent judge API requests; 1 preserves serial execution.",
+    )
     parser.add_argument("--limit", type=int, help="Judge only the first N manifest rows.")
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
@@ -416,12 +434,15 @@ def validate_args(args: argparse.Namespace) -> str:
     if (
         args.max_tokens < 1
         or args.batch_size < 1
+        or args.max_in_flight_batches < 1
         or args.timeout_seconds < 1
         or args.max_attempts < 1
     ):
         raise ValueError("Token, timeout, and attempt limits must be positive")
     if args.retry_backoff_seconds < 0:
         raise ValueError("--retry-backoff-seconds cannot be negative")
+    if args.max_retry_backoff_seconds < 0:
+        raise ValueError("--max-retry-backoff-seconds cannot be negative")
     api_key = os.environ.get(args.api_key_env)
     if not api_key:
         raise RuntimeError(f"Set {args.api_key_env} before running the semantic judge")
@@ -433,6 +454,46 @@ def batches(
 ) -> Iterable[List[Tuple[Dict[str, Any], Dict[str, Any]]]]:
     for start in range(0, len(values), size):
         yield values[start : start + size]
+
+
+def process_pending_batches(
+    pending: List[Tuple[Dict[str, Any], Dict[str, Any]]],
+    args: argparse.Namespace,
+    api_key: str,
+    batch_id_start: int,
+    on_complete: Callable[[List[Dict[str, Any]]], None],
+) -> None:
+    """Judge bounded concurrent batches and deliver completed rows to one caller."""
+    batch_iterator = enumerate(batches(pending, args.batch_size), start=batch_id_start)
+    executor = ThreadPoolExecutor(max_workers=args.max_in_flight_batches)
+    in_flight = {}
+
+    def submit_next_batch() -> bool:
+        try:
+            batch_id, batch = next(batch_iterator)
+        except StopIteration:
+            return False
+        future = executor.submit(judge_batch_with_fallback, batch, args, api_key, batch_id)
+        in_flight[future] = batch_id
+        return True
+
+    try:
+        for _ in range(args.max_in_flight_batches):
+            if not submit_next_batch():
+                break
+        while in_flight:
+            completed_futures, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+            for future in completed_futures:
+                in_flight.pop(future)
+                on_complete(future.result())
+                submit_next_batch()
+    except BaseException:
+        for future in in_flight:
+            future.cancel()
+        executor.shutdown(wait=False)
+        raise
+    else:
+        executor.shutdown(wait=True)
 
 
 def main() -> None:
@@ -487,22 +548,18 @@ def main() -> None:
                     handle.write(json.dumps(row, ensure_ascii=False) + "\n")
                 handle.flush()
                 progress.update(len(rows))
-
-            def set_mode(mode_name: str) -> None:
-                progress.set_postfix_str(f"mode={mode_name}")
-
-            for batch_index, batch in enumerate(
-                batches(pending, args.batch_size), start=batch_id_start
-            ):
-                set_mode("batch")
-                judge_batch_with_fallback(
-                    batch,
-                    args,
-                    api_key,
-                    batch_index,
-                    emit_rows=emit_rows,
-                    set_mode=set_mode,
+                modes = sorted({str(row.get("judge_mode", "unknown")) for row in rows})
+                progress.set_postfix_str(
+                    f"mode={','.join(modes)}; in_flight={args.max_in_flight_batches}"
                 )
+
+            process_pending_batches(
+                pending,
+                args,
+                api_key,
+                batch_id_start,
+                emit_rows,
+            )
 
 
 if __name__ == "__main__":
