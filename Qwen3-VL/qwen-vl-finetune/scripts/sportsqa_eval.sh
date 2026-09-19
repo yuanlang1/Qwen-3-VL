@@ -2,6 +2,11 @@
 
 set -e
 
+# Sports-QA inference uses PyTorch only. Avoid importing a TensorFlow build that
+# may be incompatible with the server image's NumPy/CUDA runtime.
+export USE_TF=0
+export USE_TORCH=1
+
 # Sports-QA paths: replace these placeholders before running on the server.
 prepared_root=PATH_TO_SPORTSQA_PREPARED_ROOT
 video_root=PATH_TO_SPORTSQA_VIDEO_ROOT
@@ -15,6 +20,7 @@ video_frames=8
 video_min_pixels=50176
 video_max_pixels=200704
 max_samples=0
+cache_video_features=false
 
 # Model configuration
 llm=$1
@@ -52,6 +58,9 @@ if [ -n "${adapter_path}" ]; then
 fi
 if [ "${max_samples}" -gt 0 ]; then
     infer_args="${infer_args} --limit ${max_samples}"
+fi
+if [ "${cache_video_features}" = true ]; then
+    infer_args="${infer_args} --cache-video-features"
 fi
 
 python tools/infer_sportsqa.py ${infer_args}

@@ -2,14 +2,16 @@
 
 import argparse
 import json
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import torch
 from qwen_vl_utils import process_vision_info
 from tqdm.auto import tqdm
-from transformers import AutoModelForImageTextToText, AutoProcessor
+from transformers import AutoProcessor
+from transformers.models.auto.modeling_auto import AutoModelForImageTextToText
 
 
 def load_json(path: Path) -> Any:
@@ -121,6 +123,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-min-pixels", type=int, default=200704)
     parser.add_argument("--video-max-pixels", type=int, default=802816)
     parser.add_argument(
+        "--cache-video-features",
+        action="store_true",
+        help="Encode each grouped video once and reuse its visual features across question batches.",
+    )
+    parser.add_argument(
         "--prompt-style",
         choices=("current", "yang-0s", "yang-cot"),
         default="current",
@@ -145,6 +152,12 @@ class CachedVideo:
     frames: Any
     video_kwargs: Dict[str, Any]
     metadata: Any = None
+
+
+@dataclass
+class CachedVideoFeatures:
+    video_features: Tuple[torch.Tensor, ...]
+    deepstack_video_features: Optional[List[torch.Tensor]] = None
 
 
 def load_video_once(video_content: Dict[str, Any], model_type: str) -> CachedVideo:
@@ -175,6 +188,114 @@ def repeat_video_kwargs(video_kwargs: Dict[str, Any], batch_size: int) -> Dict[s
             raise ValueError("Expected one sampled fps value for a cached video")
         repeated_kwargs["fps"] = fps * batch_size
     return repeated_kwargs
+
+
+def video_feature_model(model: Any) -> Any:
+    """Return the Qwen-VL module whose forward method calls get_video_features."""
+    candidates = []
+    get_base_model = getattr(model, "get_base_model", None)
+    if callable(get_base_model):
+        candidates.append(get_base_model())
+    candidates.append(model)
+
+    for candidate in candidates:
+        inner_model = getattr(candidate, "model", None)
+        if hasattr(inner_model, "get_video_features"):
+            return inner_model
+        if hasattr(candidate, "get_video_features"):
+            return candidate
+    raise TypeError("The loaded model does not expose get_video_features().")
+
+
+def first_video_inputs(inputs: Any) -> Tuple[torch.Tensor, torch.Tensor]:
+    pixel_values = inputs.get("pixel_values_videos")
+    video_grid_thw = inputs.get("video_grid_thw")
+    if not isinstance(pixel_values, torch.Tensor) or not isinstance(video_grid_thw, torch.Tensor):
+        raise ValueError("Video feature caching requires pixel_values_videos and video_grid_thw.")
+    if video_grid_thw.ndim != 2 or video_grid_thw.shape[0] < 1:
+        raise ValueError("Expected video_grid_thw with at least one video entry.")
+
+    first_grid = video_grid_thw[:1]
+    first_video_patch_count = int(first_grid.prod().item())
+    if pixel_values.shape[0] < first_video_patch_count:
+        raise ValueError("pixel_values_videos does not contain the first video's complete patch sequence.")
+    return pixel_values[:first_video_patch_count], first_grid
+
+
+def encode_video_features_once(model: Any, inputs: Any, model_type: str) -> CachedVideoFeatures:
+    """Encode the first (and only distinct) video in a grouped question batch."""
+    if model_type not in {"qwen2_5_vl", "qwen3_vl"}:
+        raise ValueError(f"Video feature caching is unsupported for model_type={model_type!r}.")
+
+    pixel_values, video_grid_thw = first_video_inputs(inputs)
+    encoded_features = video_feature_model(model).get_video_features(pixel_values, video_grid_thw)
+
+    if model_type == "qwen2_5_vl":
+        if not isinstance(encoded_features, tuple) or len(encoded_features) != 1:
+            raise ValueError("Expected one Qwen2.5-VL video feature tensor.")
+        return CachedVideoFeatures(video_features=encoded_features)
+
+    if not isinstance(encoded_features, tuple) or len(encoded_features) != 2:
+        raise ValueError("Expected Qwen3-VL video and deepstack feature tensors.")
+    video_features, deepstack_video_features = encoded_features
+    if not isinstance(video_features, tuple) or len(video_features) != 1:
+        raise ValueError("Expected one Qwen3-VL video feature tensor.")
+    if not isinstance(deepstack_video_features, list):
+        raise ValueError("Expected Qwen3-VL deepstack features as a list.")
+    return CachedVideoFeatures(
+        video_features=video_features,
+        deepstack_video_features=deepstack_video_features,
+    )
+
+
+def repeat_feature_for_batch(feature: torch.Tensor, batch_size: int) -> torch.Tensor:
+    return feature.repeat((batch_size,) + (1,) * (feature.ndim - 1))
+
+
+@contextmanager
+def reuse_cached_video_features(
+    model: Any,
+    cached_features: CachedVideoFeatures,
+    model_type: str,
+) -> Iterator[None]:
+    """Make Qwen's regular multimodal forward reuse one video's visual features."""
+    target_model = video_feature_model(model)
+    original_get_video_features = target_model.get_video_features
+
+    def cached_get_video_features(
+        _pixel_values_videos: torch.Tensor,
+        video_grid_thw: Optional[torch.Tensor] = None,
+    ) -> Any:
+        if video_grid_thw is None or video_grid_thw.ndim != 2:
+            raise ValueError("Cached video features require a batched video_grid_thw.")
+        batch_size = int(video_grid_thw.shape[0])
+        if batch_size < 1:
+            raise ValueError("Cached video features require at least one batch item.")
+
+        repeated_video_features = tuple(cached_features.video_features[0] for _ in range(batch_size))
+        if model_type == "qwen2_5_vl":
+            return repeated_video_features
+        if model_type == "qwen3_vl" and cached_features.deepstack_video_features is not None:
+            repeated_deepstack_features = [
+                repeat_feature_for_batch(feature, batch_size)
+                for feature in cached_features.deepstack_video_features
+            ]
+            return repeated_video_features, repeated_deepstack_features
+        raise ValueError(f"Cached video features are invalid for model_type={model_type!r}.")
+
+    target_model.get_video_features = cached_get_video_features
+    try:
+        yield
+    finally:
+        target_model.get_video_features = original_get_video_features
+
+
+def drop_repeated_video_pixels(inputs: Any) -> None:
+    """Keep Qwen's video-input branch active without retaining repeated raw video patches."""
+    pixel_values = inputs.get("pixel_values_videos")
+    if not isinstance(pixel_values, torch.Tensor):
+        raise ValueError("Video feature caching requires pixel_values_videos.")
+    inputs["pixel_values_videos"] = pixel_values.new_empty((0,) + tuple(pixel_values.shape[1:]))
 
 
 def prepare_inputs_from_cached_video(
@@ -231,6 +352,9 @@ def main() -> None:
     # Intermediate LoRA checkpoints do not necessarily contain a processor.
     # The processor must match the immutable base model in every comparison.
     processor = AutoProcessor.from_pretrained(args.model_name_or_path)
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is not None:
+        tokenizer.padding_side = "left"
     configure_video_processor(processor, args)
     model_kwargs: Dict[str, Any] = {"dtype": args.dtype, "device_map": args.device_map}
     if args.attn_implementation:
@@ -245,6 +369,8 @@ def main() -> None:
         f"Video sampling: model_type={model.config.model_type}, frames={args.video_frames}; "
         f"prompt_style={args.prompt_style}; {len(records)} QAs across {len(video_groups)} unique videos"
     )
+    if args.cache_video_features:
+        print("Video feature cache: enabled (one visual encode per grouped video).")
 
     args.output_file.parent.mkdir(parents=True, exist_ok=True)
     mode = "a" if args.resume else "w"
@@ -253,6 +379,7 @@ def main() -> None:
             for video_index, (video_path, video_records) in enumerate(video_groups, start=1):
                 video_content = build_video_content(video_path, args)
                 cached_video = load_video_once(video_content, model.config.model_type)
+                cached_video_features: Optional[CachedVideoFeatures] = None
                 for batch_records in chunks(video_records, args.batch_size):
                     messages = build_messages(batch_records, video_content, args.prompt_style)
                     inputs = prepare_inputs_from_cached_video(
@@ -279,7 +406,18 @@ def main() -> None:
                     if args.temperature > 0:
                         generation_kwargs.update({"temperature": args.temperature, "top_p": args.top_p})
                     with torch.inference_mode():
-                        generated_ids = model.generate(**inputs, **generation_kwargs)
+                        if args.cache_video_features:
+                            if cached_video_features is None:
+                                cached_video_features = encode_video_features_once(
+                                    model, inputs, model.config.model_type
+                                )
+                            drop_repeated_video_pixels(inputs)
+                            with reuse_cached_video_features(
+                                model, cached_video_features, model.config.model_type
+                            ):
+                                generated_ids = model.generate(**inputs, **generation_kwargs)
+                        else:
+                            generated_ids = model.generate(**inputs, **generation_kwargs)
                     trimmed_ids = [
                         output_ids[len(input_ids) :]
                         for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
@@ -311,6 +449,7 @@ def main() -> None:
                         videos=f"{video_index}/{len(video_groups)}",
                     )
                 del cached_video
+                del cached_video_features
 
 
 if __name__ == "__main__":

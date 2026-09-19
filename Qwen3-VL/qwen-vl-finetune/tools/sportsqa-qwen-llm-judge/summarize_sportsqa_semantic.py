@@ -84,6 +84,11 @@ def main() -> None:
     prompt_versions = set()
     judge_requested_batch_sizes = set()
     judge_max_in_flight_batches = set()
+    judge_rate_limit_rpms = set()
+    judge_rate_limit_tpms = set()
+    judge_rate_limit_safety_factors = set()
+    judge_enable_thinking_values = set()
+    decision_source_counts: Dict[str, int] = defaultdict(int)
     for item in manifest:
         qa_id = str(item["qa_id"])
         row = judgments.get(qa_id)
@@ -100,10 +105,25 @@ def main() -> None:
         successful_rows.append(row)
         judge_models.add(str(row.get("judge_model")))
         prompt_versions.add(str(row.get("judge_prompt_version")))
-        judge_requested_batch_sizes.add(
-            row.get("judge_requested_batch_size", row.get("batch_size"))
-        )
-        judge_max_in_flight_batches.add(row.get("judge_max_in_flight_batches", 1))
+        requested_batch_size = row.get("judge_requested_batch_size", row.get("batch_size"))
+        if requested_batch_size is not None:
+            judge_requested_batch_sizes.add(requested_batch_size)
+        max_in_flight_batches = row.get("judge_max_in_flight_batches", 1)
+        if max_in_flight_batches is not None:
+            judge_max_in_flight_batches.add(max_in_flight_batches)
+        rate_limit_rpm = row.get("judge_rate_limit_rpm")
+        if rate_limit_rpm is not None:
+            judge_rate_limit_rpms.add(rate_limit_rpm)
+        rate_limit_tpm = row.get("judge_rate_limit_tpm")
+        if rate_limit_tpm is not None:
+            judge_rate_limit_tpms.add(rate_limit_tpm)
+        rate_limit_safety_factor = row.get("judge_rate_limit_safety_factor")
+        if rate_limit_safety_factor is not None:
+            judge_rate_limit_safety_factors.add(rate_limit_safety_factor)
+        enable_thinking = row.get("judge_enable_thinking")
+        if enable_thinking is not None:
+            judge_enable_thinking_values.add(bool(enable_thinking))
+        decision_source_counts[str(row.get("decision_source", "llm"))] += 1
 
     incomplete_count = len(missing_ids) + len(failed_ids)
     if args.require_complete and incomplete_count:
@@ -118,6 +138,11 @@ def main() -> None:
             "judge_prompt_versions": sorted(prompt_versions),
             "judge_requested_batch_sizes": sorted(judge_requested_batch_sizes),
             "judge_max_in_flight_batches": sorted(judge_max_in_flight_batches),
+            "judge_rate_limit_rpms": sorted(judge_rate_limit_rpms),
+            "judge_rate_limit_tpms": sorted(judge_rate_limit_tpms),
+            "judge_rate_limit_safety_factors": sorted(judge_rate_limit_safety_factors),
+            "judge_enable_thinking_values": sorted(judge_enable_thinking_values),
+            "decision_source_counts": dict(sorted(decision_source_counts.items())),
         },
         "expected_count": len(manifest),
         "judged_count": len(successful_rows),
