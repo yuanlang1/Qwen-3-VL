@@ -64,6 +64,43 @@ bash scripts/sportsqa_eval.sh Qwen/Qwen2.5-VL-7B-Instruct sportsqa-qwen25vl-7b
 For a server smoke test, change `max_samples=0` to a small positive number in
 the same script. Select one frame configuration by validation Macro-F1.
 
+The evaluator uses a DataLoader inference pipeline by default. Each QA is an
+independent sample, so repeated references to the same video are decoded again;
+there is no video or visual-feature cache. A DataLoader task always decodes exactly
+one QA. The main process collects those ordered decoded samples, runs the processor
+once, and sends up to `batch_size` samples to `model.generate()`. Therefore
+`batch_size` controls only the GPU batch and does not multiply the amount of work
+assigned to each CPU worker.
+
+The parameters are separated by stage:
+
+| Stage | Parameters | Meaning |
+| --- | --- | --- |
+| GPU generation | `batch_size`, `max_new_tokens` | Number of decoded QAs per model call and output length |
+| CPU decode/DataLoader | `video_backend`, `decoder_threads`, `num_workers`, `prefetch_factor`, `persistent_workers`, `timeout`, `multiprocessing_context` | Decoder implementation, CPU concurrency, and number of individual decoded QAs queued per worker |
+| Main-process processor/H2D | `use_fast_processor`, `pin_memory` | Processor implementation and pinned-memory transfer preparation |
+| Video sampling | `video_frames`, `video_min_pixels`, `video_max_pixels` | Frame count and visual token budget |
+
+The default `video_backend=torchcodec` is strict: startup fails before model
+inference if TorchCodec cannot be imported, rather than silently selecting
+torchvision. This repository pins `torchcodec==0.7.0` for `torch==2.8.0`; the
+server must also expose shared FFmpeg 4-9 libraries. Check the server environment
+with:
+
+```bash
+python -c "import torch, torchcodec; from torchcodec.decoders import VideoDecoder; print(torch.__version__, torchcodec.__version__)"
+ffmpeg -version
+```
+
+Use `video_backend=decord` only after installing Decord, or
+`video_backend=torchvision` when its slower CPU path is intentional. Set
+`video_backend=auto` only if fallback is desired. Keep
+`num_workers * decoder_threads` below the CPU core budget. Tune `num_workers`
+first, then `prefetch_factor`, and only increase `batch_size` for separate GPU
+throughput experiments. The processor uses `do_resize=False` because
+`qwen-vl-utils` already resizes decoded frames, so regenerate older baselines before
+comparing predictions. The pipeline remains compatible with `--resume`.
+
 ## 4. LoRA fine-tuning and checkpoint selection
 
 Edit the training values at the top of `scripts/sportsqa_sft.sh`, then launch

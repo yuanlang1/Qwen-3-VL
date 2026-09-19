@@ -39,9 +39,9 @@ if [[ "${SILICONFLOW_API_KEY}" == 'YOUR_SILICONFLOW_API_KEY' ]]; then
 fi
 
 # Replace these explicit placeholders before running on the server.
-prepared_root=PATH_TO_SPORTSQA_PREPARED_ROOT
-video_root=PATH_TO_SPORTSQA_VIDEO_ROOT
-output_root=PATH_TO_SPORTSQA_WORK_ROOT
+prepared_root=/home/user/data/sportsqa_prepared
+video_root=/home/user/data/export_test
+output_root=/home/user/data/sportsqa_output/qwen2.5-vl
 
 required_paths=("${prepared_root}" "${output_root}")
 if [ "${judge_only}" = false ]; then
@@ -57,14 +57,29 @@ done
 # Yang-style Qwen inference profile. The paper does not disclose video sampling;
 # freeze this documented profile rather than selecting it on the test set.
 split=test
+# GPU generation parameters. batch_size does not change DataLoader task size.
 batch_size=1
 max_new_tokens=32
+
+# Video sampling parameters
 video_frames=8
 video_min_pixels=50176
 video_max_pixels=200704
 prompt_style=yang-0s
 max_samples=0
-cache_video_features=false
+
+# CPU DataLoader/decoder parameters. Each prefetched item is one decoded QA.
+video_backend=torchcodec
+decoder_threads=2
+num_workers=4
+prefetch_factor=2
+persistent_workers=false
+
+# Main-process processor/H2D parameters
+use_fast_processor=true
+pin_memory=true
+timeout=120
+multiprocessing_context=spawn
 
 # SiliconFlow semantic judge. The API key is read only by the judge from
 # SILICONFLOW_API_KEY and is never passed on the command line or written to disk.
@@ -104,7 +119,13 @@ if [ "${judge_only}" = false ]; then
         --video-frames "${video_frames}"
         --video-min-pixels "${video_min_pixels}"
         --video-max-pixels "${video_max_pixels}"
+        --video-backend "${video_backend}"
+        --decoder-threads "${decoder_threads}"
         --prompt-style "${prompt_style}"
+        --num-workers "${num_workers}"
+        --prefetch-factor "${prefetch_factor}"
+        --timeout "${timeout}"
+        --multiprocessing-context "${multiprocessing_context}"
     )
     if [ -n "${adapter_path}" ]; then
         infer_args+=(--adapter-path "${adapter_path}")
@@ -112,8 +133,14 @@ if [ "${judge_only}" = false ]; then
     if [ "${max_samples}" -gt 0 ]; then
         infer_args+=(--limit "${max_samples}")
     fi
-    if [ "${cache_video_features}" = true ]; then
-        infer_args+=(--cache-video-features)
+    if [ "${persistent_workers}" = true ]; then
+        infer_args+=(--persistent-workers)
+    fi
+    if [ "${pin_memory}" = false ]; then
+        infer_args+=(--no-pin-memory)
+    fi
+    if [ "${use_fast_processor}" = false ]; then
+        infer_args+=(--no-use-fast-processor)
     fi
 
     python "${project_root}/tools/infer_sportsqa.py" "${infer_args[@]}"

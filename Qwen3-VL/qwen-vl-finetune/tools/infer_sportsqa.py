@@ -1,17 +1,31 @@
 """Run deterministic Qwen-VL inference on a prepared Sports-QA manifest."""
 
 import argparse
+import importlib
 import json
-from contextlib import contextmanager
+import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import torch
-from qwen_vl_utils import process_vision_info
 from tqdm.auto import tqdm
 from transformers import AutoProcessor
 from transformers.models.auto.modeling_auto import AutoModelForImageTextToText
+
+from sportsqa_dataloader import (
+    DecodedSample,
+    PipelineConfig,
+    PreparedBatch,
+    SportsQADecoder,
+    SportsQADataset,
+    build_qa_work_items,
+    configure_video_processor,
+    make_dataloader,
+    move_inputs_to_device,
+    prepare_batch,
+)
 
 
 def load_json(path: Path) -> Any:
@@ -30,79 +44,13 @@ def read_completed_ids(path: Path) -> set[str]:
     return completed
 
 
-def configure_video_processor(processor: Any, args: argparse.Namespace) -> None:
-    video_processor = getattr(processor, "video_processor", None)
-    if video_processor is None:
-        return
-    for attribute, value in (
-        ("min_pixels", args.video_min_pixels),
-        ("max_pixels", args.video_max_pixels),
-    ):
-        if value is not None and hasattr(video_processor, attribute):
-            setattr(video_processor, attribute, value)
-    if hasattr(video_processor, "size") and isinstance(video_processor.size, dict):
-        if args.video_min_pixels is not None:
-            video_processor.size["shortest_edge"] = args.video_min_pixels
-        if args.video_max_pixels is not None:
-            video_processor.size["longest_edge"] = args.video_max_pixels
-
-
-def resolve_video_path(video_root: Path, record: Dict[str, Any]) -> Path:
-    path = Path(str(record["video"]))
-    return path if path.is_absolute() else video_root / path
-
-
-def group_records_by_video(
-    records: Iterable[Dict[str, Any]], video_root: Path
-) -> List[Tuple[Path, List[Dict[str, Any]]]]:
-    groups: Dict[Path, List[Dict[str, Any]]] = {}
-    for record in records:
-        video_path = resolve_video_path(video_root, record)
-        if not video_path.is_file():
-            raise FileNotFoundError(f"Missing video for qa_id={record['qa_id']}: {video_path}")
-        groups.setdefault(video_path, []).append(record)
-    return list(groups.items())
-
-
-def build_video_content(video_path: Path, args: argparse.Namespace) -> Dict[str, Any]:
-    return {
-        "type": "video",
-        "video": str(video_path),
-        "nframes": args.video_frames,
-        "min_pixels": args.video_min_pixels,
-        "max_pixels": args.video_max_pixels,
-    }
-
-
-def build_messages(
-    records: Iterable[Dict[str, Any]], video_content: Dict[str, Any], prompt_style: str
-) -> List[List[Dict[str, Any]]]:
-    conversations = []
-    for record in records:
-        question = str(record["question"]).strip()
-        if prompt_style == "current":
-            prompt = f"Question: {question}\nAnswer with only the final answer."
-        elif prompt_style == "yang-0s":
-            prompt = question
-        else:
-            prompt = f"Let's think step by step. {question}"
-        conversations.append(
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        dict(video_content),
-                        {"type": "text", "text": prompt},
-                    ],
-                }
-            ]
-        )
-    return conversations
-
-
-def chunks(records: List[Dict[str, Any]], batch_size: int) -> Iterable[List[Dict[str, Any]]]:
-    for index in range(0, len(records), batch_size):
-        yield records[index : index + batch_size]
+def select_pending_records(
+    records: List[Dict[str, Any]], completed_ids: set[str], limit: Optional[int],
+) -> List[Dict[str, Any]]:
+    pending = [
+        record for record in records if str(record["qa_id"]) not in completed_ids
+    ]
+    return pending if limit is None else pending[:limit]
 
 
 def parse_args() -> argparse.Namespace:
@@ -112,7 +60,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-root", type=Path, required=True)
     parser.add_argument("--output-file", type=Path, required=True)
     parser.add_argument("--adapter-path", type=Path)
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="GPU model.generate batch size; DataLoader tasks always contain one QA.",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
@@ -123,9 +76,54 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-min-pixels", type=int, default=200704)
     parser.add_argument("--video-max-pixels", type=int, default=802816)
     parser.add_argument(
-        "--cache-video-features",
-        action="store_true",
-        help="Encode each grouped video once and reuse its visual features across question batches.",
+        "--video-backend",
+        choices=("torchcodec", "decord", "torchvision", "auto"),
+        default="torchcodec",
+        help=(
+            "CPU video decoder. The default fails early if TorchCodec cannot load; "
+            "use auto only when fallback is intentional."
+        ),
+    )
+    parser.add_argument(
+        "--decoder-threads", type=int, default=2, help="FFmpeg threads per worker."
+    )
+    parser.add_argument(
+        "--num-workers", type=int, default=4, help="CPU video-decode workers."
+    )
+    parser.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=2,
+        help="Individual decoded QAs prefetched per worker.",
+    )
+    parser.add_argument(
+        "--persistent-workers",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Keep CPU decode workers alive until the DataLoader is destroyed.",
+    )
+    parser.add_argument(
+        "--pin-memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Pin processor outputs in the main process before asynchronous H2D.",
+    )
+    parser.add_argument(
+        "--use-fast-processor",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Select the Transformers fast image/video processor explicitly.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=120,
+        help="Maximum seconds to wait for the next decoded QA.",
+    )
+    parser.add_argument(
+        "--multiprocessing-context",
+        default="spawn",
+        help="PyTorch DataLoader multiprocessing start method.",
     )
     parser.add_argument(
         "--prompt-style",
@@ -138,318 +136,279 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def validate_video_args(args: argparse.Namespace) -> None:
-    if args.video_frames < 2:
-        raise ValueError("--video-frames must be at least 2")
-    if args.video_frames % 2:
-        raise ValueError("--video-frames must be even")
-    if args.video_min_pixels < 1 or args.video_max_pixels < args.video_min_pixels:
-        raise ValueError("Video pixel limits must satisfy 1 <= min_pixels <= max_pixels")
-
-
-@dataclass
-class CachedVideo:
-    frames: Any
-    video_kwargs: Dict[str, Any]
-    metadata: Any = None
-
-
-@dataclass
-class CachedVideoFeatures:
-    video_features: Tuple[torch.Tensor, ...]
-    deepstack_video_features: Optional[List[torch.Tensor]] = None
-
-
-def load_video_once(video_content: Dict[str, Any], model_type: str) -> CachedVideo:
-    conversation = [[{"role": "user", "content": [dict(video_content)]}]]
-    if model_type == "qwen3_vl":
-        _, videos, video_kwargs = process_vision_info(
-            conversation,
-            image_patch_size=16,
-            return_video_kwargs=True,
-            return_video_metadata=True,
-        )
-        if videos is None or len(videos) != 1:
-            raise ValueError("Expected exactly one decoded video")
-        frames, metadata = videos[0]
-        return CachedVideo(frames=frames, video_kwargs=video_kwargs, metadata=metadata)
-
-    _, videos, video_kwargs = process_vision_info(conversation, return_video_kwargs=True)
-    if videos is None or len(videos) != 1:
-        raise ValueError("Expected exactly one decoded video")
-    return CachedVideo(frames=videos[0], video_kwargs=video_kwargs)
-
-
-def repeat_video_kwargs(video_kwargs: Dict[str, Any], batch_size: int) -> Dict[str, Any]:
-    repeated_kwargs = dict(video_kwargs)
-    fps = repeated_kwargs.get("fps")
-    if isinstance(fps, list):
-        if len(fps) != 1:
-            raise ValueError("Expected one sampled fps value for a cached video")
-        repeated_kwargs["fps"] = fps * batch_size
-    return repeated_kwargs
-
-
-def video_feature_model(model: Any) -> Any:
-    """Return the Qwen-VL module whose forward method calls get_video_features."""
-    candidates = []
-    get_base_model = getattr(model, "get_base_model", None)
-    if callable(get_base_model):
-        candidates.append(get_base_model())
-    candidates.append(model)
-
-    for candidate in candidates:
-        inner_model = getattr(candidate, "model", None)
-        if hasattr(inner_model, "get_video_features"):
-            return inner_model
-        if hasattr(candidate, "get_video_features"):
-            return candidate
-    raise TypeError("The loaded model does not expose get_video_features().")
-
-
-def first_video_inputs(inputs: Any) -> Tuple[torch.Tensor, torch.Tensor]:
-    pixel_values = inputs.get("pixel_values_videos")
-    video_grid_thw = inputs.get("video_grid_thw")
-    if not isinstance(pixel_values, torch.Tensor) or not isinstance(video_grid_thw, torch.Tensor):
-        raise ValueError("Video feature caching requires pixel_values_videos and video_grid_thw.")
-    if video_grid_thw.ndim != 2 or video_grid_thw.shape[0] < 1:
-        raise ValueError("Expected video_grid_thw with at least one video entry.")
-
-    first_grid = video_grid_thw[:1]
-    first_video_patch_count = int(first_grid.prod().item())
-    if pixel_values.shape[0] < first_video_patch_count:
-        raise ValueError("pixel_values_videos does not contain the first video's complete patch sequence.")
-    return pixel_values[:first_video_patch_count], first_grid
-
-
-def encode_video_features_once(model: Any, inputs: Any, model_type: str) -> CachedVideoFeatures:
-    """Encode the first (and only distinct) video in a grouped question batch."""
-    if model_type not in {"qwen2_5_vl", "qwen3_vl"}:
-        raise ValueError(f"Video feature caching is unsupported for model_type={model_type!r}.")
-
-    pixel_values, video_grid_thw = first_video_inputs(inputs)
-    encoded_features = video_feature_model(model).get_video_features(pixel_values, video_grid_thw)
-
-    if model_type == "qwen2_5_vl":
-        if not isinstance(encoded_features, tuple) or len(encoded_features) != 1:
-            raise ValueError("Expected one Qwen2.5-VL video feature tensor.")
-        return CachedVideoFeatures(video_features=encoded_features)
-
-    if not isinstance(encoded_features, tuple) or len(encoded_features) != 2:
-        raise ValueError("Expected Qwen3-VL video and deepstack feature tensors.")
-    video_features, deepstack_video_features = encoded_features
-    if not isinstance(video_features, tuple) or len(video_features) != 1:
-        raise ValueError("Expected one Qwen3-VL video feature tensor.")
-    if not isinstance(deepstack_video_features, list):
-        raise ValueError("Expected Qwen3-VL deepstack features as a list.")
-    return CachedVideoFeatures(
-        video_features=video_features,
-        deepstack_video_features=deepstack_video_features,
-    )
-
-
-def repeat_feature_for_batch(feature: torch.Tensor, batch_size: int) -> torch.Tensor:
-    return feature.repeat((batch_size,) + (1,) * (feature.ndim - 1))
-
-
-@contextmanager
-def reuse_cached_video_features(
-    model: Any,
-    cached_features: CachedVideoFeatures,
-    model_type: str,
-) -> Iterator[None]:
-    """Make Qwen's regular multimodal forward reuse one video's visual features."""
-    target_model = video_feature_model(model)
-    original_get_video_features = target_model.get_video_features
-
-    def cached_get_video_features(
-        _pixel_values_videos: torch.Tensor,
-        video_grid_thw: Optional[torch.Tensor] = None,
-    ) -> Any:
-        if video_grid_thw is None or video_grid_thw.ndim != 2:
-            raise ValueError("Cached video features require a batched video_grid_thw.")
-        batch_size = int(video_grid_thw.shape[0])
-        if batch_size < 1:
-            raise ValueError("Cached video features require at least one batch item.")
-
-        repeated_video_features = tuple(cached_features.video_features[0] for _ in range(batch_size))
-        if model_type == "qwen2_5_vl":
-            return repeated_video_features
-        if model_type == "qwen3_vl" and cached_features.deepstack_video_features is not None:
-            repeated_deepstack_features = [
-                repeat_feature_for_batch(feature, batch_size)
-                for feature in cached_features.deepstack_video_features
-            ]
-            return repeated_video_features, repeated_deepstack_features
-        raise ValueError(f"Cached video features are invalid for model_type={model_type!r}.")
-
-    target_model.get_video_features = cached_get_video_features
-    try:
-        yield
-    finally:
-        target_model.get_video_features = original_get_video_features
-
-
-def drop_repeated_video_pixels(inputs: Any) -> None:
-    """Keep Qwen's video-input branch active without retaining repeated raw video patches."""
-    pixel_values = inputs.get("pixel_values_videos")
-    if not isinstance(pixel_values, torch.Tensor):
-        raise ValueError("Video feature caching requires pixel_values_videos.")
-    inputs["pixel_values_videos"] = pixel_values.new_empty((0,) + tuple(pixel_values.shape[1:]))
-
-
-def prepare_inputs_from_cached_video(
-    processor: Any,
-    model_type: str,
-    messages: List[List[Dict[str, Any]]],
-    cached_video: CachedVideo,
-) -> Any:
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    batch_size = len(messages)
-    videos = [cached_video.frames] * batch_size
-    video_kwargs = repeat_video_kwargs(cached_video.video_kwargs, batch_size)
-    if model_type == "qwen3_vl":
-        return processor(
-            text=text,
-            images=None,
-            videos=videos,
-            video_metadata=[cached_video.metadata] * batch_size,
-            padding=True,
-            return_tensors="pt",
-            **video_kwargs,
-        )
-
-    return processor(
-        text=text,
-        images=None,
-        videos=videos,
-        padding=True,
-        return_tensors="pt",
-        **video_kwargs,
-    )
-
-
-def main() -> None:
-    args = parse_args()
+def validate_args(args: argparse.Namespace) -> None:
     if args.batch_size < 1:
         raise ValueError("--batch-size must be at least 1")
     if args.temperature < 0:
         raise ValueError("--temperature cannot be negative")
-    validate_video_args(args)
+    if args.video_frames < 2 or args.video_frames % 2:
+        raise ValueError("--video-frames must be an even integer of at least 2")
+    if args.video_min_pixels < 1 or args.video_max_pixels < args.video_min_pixels:
+        raise ValueError(
+            "Video pixel limits must satisfy 1 <= min_pixels <= max_pixels"
+        )
+    if args.num_workers < 1:
+        raise ValueError("--num-workers must be at least 1 for the DataLoader pipeline")
+    if args.decoder_threads < 1:
+        raise ValueError("--decoder-threads must be at least 1")
+    if args.prefetch_factor < 1:
+        raise ValueError("--prefetch-factor must be at least 1")
+    if args.timeout <= 0:
+        raise ValueError("--timeout must be greater than 0")
+
+
+VIDEO_BACKEND_MODULES = {
+    "torchcodec": "torchcodec.decoders",
+    "decord": "decord",
+    "torchvision": "torchvision",
+}
+
+
+def configure_video_backend(requested: str) -> str:
+    """Select a decoder before spawning workers and verify that it can load."""
+    candidates = list(VIDEO_BACKEND_MODULES) if requested == "auto" else [requested]
+    failures = []
+    for backend in candidates:
+        try:
+            importlib.import_module(VIDEO_BACKEND_MODULES[backend])
+        except Exception as error:
+            failures.append(f"{backend}: {error}")
+            continue
+        os.environ["FORCE_QWENVL_VIDEO_READER"] = backend
+        vision_process = importlib.import_module("qwen_vl_utils.vision_process")
+        if hasattr(vision_process, "FORCE_QWENVL_VIDEO_READER"):
+            vision_process.FORCE_QWENVL_VIDEO_READER = backend
+        backend_selector = getattr(vision_process, "get_video_reader_backend", None)
+        if hasattr(backend_selector, "cache_clear"):
+            backend_selector.cache_clear()
+        return backend
+
+    details = "; ".join(failures)
+    if requested == "torchcodec":
+        raise RuntimeError(
+            "--video-backend=torchcodec was requested, but TorchCodec could not load. "
+            "This project expects torchcodec==0.7.0 with torch==2.8.0 and a shared "
+            "FFmpeg 4-9 installation visible to the Python process. Verify with "
+            '`python -c "from torchcodec.decoders import VideoDecoder"` and '
+            "`ffmpeg -version`. Original error: "
+            f"{details}"
+        )
+    raise RuntimeError(
+        f"No usable video backend was found for --video-backend={requested}: {details}"
+    )
+
+
+def iter_gpu_batches(
+    samples: Iterable[DecodedSample], batch_size: int
+) -> Iterator[Tuple[List[DecodedSample], float]]:
+    """Group ordered decoded samples; batch_size has no effect inside DataLoader."""
+    iterator = iter(samples)
+    while True:
+        batch = []
+        loader_wait_ms = 0.0
+        for _ in range(batch_size):
+            started = time.perf_counter()
+            try:
+                sample = next(iterator)
+            except StopIteration:
+                if batch:
+                    yield batch, loader_wait_ms
+                return
+            loader_wait_ms += (time.perf_counter() - started) * 1000
+            batch.append(sample)
+        yield batch, loader_wait_ms
+
+
+@dataclass
+class InferenceTimings:
+    decode_ms: float = 0.0
+    processor_ms: float = 0.0
+    loader_wait_ms: float = 0.0
+    pin_memory_ms: float = 0.0
+    h2d_enqueue_ms: float = 0.0
+    generate_ms: float = 0.0
+    batch_count: int = 0
+
+    def add(
+        self,
+        batch: PreparedBatch,
+        loader_wait_ms: float,
+        pin_memory_ms: float,
+        h2d_enqueue_ms: float,
+        generate_ms: float,
+    ) -> None:
+        self.decode_ms += batch.decode_ms
+        self.processor_ms += batch.processor_ms
+        self.loader_wait_ms += loader_wait_ms
+        self.pin_memory_ms += pin_memory_ms
+        self.h2d_enqueue_ms += h2d_enqueue_ms
+        self.generate_ms += generate_ms
+        self.batch_count += 1
+
+    def print_summary(self) -> None:
+        print(
+            "Sports-QA pipeline timing (ms): "
+            f"decode={self.decode_ms:.1f}, processor={self.processor_ms:.1f}, "
+            f"dataloader_wait={self.loader_wait_ms:.1f}, "
+            f"pin_memory={self.pin_memory_ms:.1f}, "
+            f"h2d_enqueue={self.h2d_enqueue_ms:.1f}, generate={self.generate_ms:.1f}, "
+            f"batches={self.batch_count}"
+        )
+
+
+def max_context_length(model: Any) -> Optional[int]:
+    max_context = getattr(model.config, "max_position_embeddings", None)
+    if max_context is None:
+        max_context = getattr(
+            getattr(model.config, "text_config", None), "max_position_embeddings", None
+        )
+    return max_context
+
+
+def generation_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {
+        "max_new_tokens": args.max_new_tokens,
+        "do_sample": args.temperature > 0,
+    }
+    if args.temperature > 0:
+        kwargs.update({"temperature": args.temperature, "top_p": args.top_p})
+    return kwargs
+
+
+def decode_predictions(
+    processor: Any, inputs: Dict[str, Any], generated_ids: Any
+) -> List[str]:
+    trimmed_ids = [
+        output_ids[len(input_ids) :]
+        for input_ids, output_ids in zip(inputs["input_ids"], generated_ids)
+    ]
+    return processor.batch_decode(
+        trimmed_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False,
+    )
+
+
+def write_predictions(
+    output_handle: Any,
+    batch: PreparedBatch,
+    predictions: List[str],
+    args: argparse.Namespace,
+) -> None:
+    if len(predictions) != len(batch.records):
+        raise RuntimeError(
+            f"Model returned {len(predictions)} predictions for {len(batch.records)} QA records"
+        )
+    for record, prediction in zip(batch.records, predictions):
+        result = {
+            "qa_id": record["qa_id"],
+            "video_id": record["video_id"],
+            "type": record["type"],
+            "sport": record["sport"],
+            "question": record["question"],
+            "answer": record["answer"],
+            "ans_cls": record["ans_cls"],
+            "prediction_raw": prediction,
+            "model_name_or_path": args.model_name_or_path,
+            "adapter_path": str(args.adapter_path) if args.adapter_path else None,
+            "prompt_style": args.prompt_style,
+        }
+        output_handle.write(json.dumps(result, ensure_ascii=False) + "\n")
+    output_handle.flush()
+
+
+def main() -> None:
+    args = parse_args()
+    validate_args(args)
 
     records = load_json(args.manifest)
     if not isinstance(records, list):
         raise ValueError("--manifest must contain a JSON list")
     completed_ids = read_completed_ids(args.output_file) if args.resume else set()
-    records = [record for record in records if str(record["qa_id"]) not in completed_ids]
-    if args.limit is not None:
-        records = records[: args.limit]
+    records = select_pending_records(records, completed_ids, args.limit)
     if not records:
-        print("Sports-QA inference: no pending QAs; existing predictions are unchanged.")
+        print(
+            "Sports-QA inference: no pending QAs; existing predictions are unchanged."
+        )
         return
-    video_groups = group_records_by_video(records, args.video_root)
+    work_items = build_qa_work_items(records, args.video_root)
+    os.environ["TORCHCODEC_NUM_THREADS"] = str(args.decoder_threads)
+    video_backend = configure_video_backend(args.video_backend)
 
-    # Intermediate LoRA checkpoints do not necessarily contain a processor.
-    # The processor must match the immutable base model in every comparison.
-    processor = AutoProcessor.from_pretrained(args.model_name_or_path)
-    tokenizer = getattr(processor, "tokenizer", None)
-    if tokenizer is not None:
-        tokenizer.padding_side = "left"
-    configure_video_processor(processor, args)
     model_kwargs: Dict[str, Any] = {"dtype": args.dtype, "device_map": args.device_map}
     if args.attn_implementation:
         model_kwargs["attn_implementation"] = args.attn_implementation
-    model = AutoModelForImageTextToText.from_pretrained(args.model_name_or_path, **model_kwargs)
+    model = AutoModelForImageTextToText.from_pretrained(
+        args.model_name_or_path, **model_kwargs
+    )
     if args.adapter_path:
         from peft import PeftModel
 
         model = PeftModel.from_pretrained(model, str(args.adapter_path))
     model.eval()
+    processor = AutoProcessor.from_pretrained(
+        args.model_name_or_path,
+        local_files_only=True,
+        use_fast=args.use_fast_processor,
+    )
+
+    pipeline_config = PipelineConfig(
+        model_type=model.config.model_type,
+        prompt_style=args.prompt_style,
+        video_frames=args.video_frames,
+        video_min_pixels=args.video_min_pixels,
+        video_max_pixels=args.video_max_pixels,
+        max_new_tokens=args.max_new_tokens,
+        max_context=max_context_length(model),
+    )
+    configure_video_processor(processor, pipeline_config)
+    dataset = SportsQADataset(work_items)
+    decoder = SportsQADecoder(pipeline_config)
+    dataloader = make_dataloader(dataset, decoder, args)
     print(
         f"Video sampling: model_type={model.config.model_type}, frames={args.video_frames}; "
-        f"prompt_style={args.prompt_style}; {len(records)} QAs across {len(video_groups)} unique videos"
+        f"prompt_style={args.prompt_style}; {len(records)} independent QAs; "
+        f"gpu_batch_size={args.batch_size}; video_backend={video_backend}, "
+        f"decoder_threads={args.decoder_threads}; num_workers={args.num_workers}, "
+        f"prefetch_factor={args.prefetch_factor} samples/worker"
     )
-    if args.cache_video_features:
-        print("Video feature cache: enabled (one visual encode per grouped video).")
 
+    timings = InferenceTimings()
+    kwargs = generation_kwargs(args)
     args.output_file.parent.mkdir(parents=True, exist_ok=True)
     mode = "a" if args.resume else "w"
     with args.output_file.open(mode, encoding="utf-8") as output_handle:
-        with tqdm(total=len(records), desc="Sports-QA inference", unit="qa", dynamic_ncols=True) as progress:
-            for video_index, (video_path, video_records) in enumerate(video_groups, start=1):
-                video_content = build_video_content(video_path, args)
-                cached_video = load_video_once(video_content, model.config.model_type)
-                cached_video_features: Optional[CachedVideoFeatures] = None
-                for batch_records in chunks(video_records, args.batch_size):
-                    messages = build_messages(batch_records, video_content, args.prompt_style)
-                    inputs = prepare_inputs_from_cached_video(
-                        processor, model.config.model_type, messages, cached_video
-                    )
-                    input_token_count = inputs.input_ids.shape[-1]
-                    max_context = getattr(model.config, "max_position_embeddings", None)
-                    if max_context is None:
-                        max_context = getattr(
-                            getattr(model.config, "text_config", None), "max_position_embeddings", None
-                        )
-                    if max_context is not None and input_token_count + args.max_new_tokens > max_context:
-                        raise RuntimeError(
-                            "Video preprocessing produced "
-                            f"{input_token_count} input tokens, which leaves insufficient context for "
-                            f"{args.max_new_tokens} generated tokens (model limit: {max_context}). "
-                            "Reduce --video-frames or --video-max-pixels."
-                        )
-                    inputs = inputs.to(model.device)
-                    generation_kwargs: Dict[str, Any] = {
-                        "max_new_tokens": args.max_new_tokens,
-                        "do_sample": args.temperature > 0,
-                    }
-                    if args.temperature > 0:
-                        generation_kwargs.update({"temperature": args.temperature, "top_p": args.top_p})
-                    with torch.inference_mode():
-                        if args.cache_video_features:
-                            if cached_video_features is None:
-                                cached_video_features = encode_video_features_once(
-                                    model, inputs, model.config.model_type
-                                )
-                            drop_repeated_video_pixels(inputs)
-                            with reuse_cached_video_features(
-                                model, cached_video_features, model.config.model_type
-                            ):
-                                generated_ids = model.generate(**inputs, **generation_kwargs)
-                        else:
-                            generated_ids = model.generate(**inputs, **generation_kwargs)
-                    trimmed_ids = [
-                        output_ids[len(input_ids) :]
-                        for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
-                    ]
-                    predictions = processor.batch_decode(
-                        trimmed_ids,
-                        skip_special_tokens=True,
-                        clean_up_tokenization_spaces=False,
-                    )
-                    for record, prediction in zip(batch_records, predictions):
-                        result = {
-                            "qa_id": record["qa_id"],
-                            "video_id": record["video_id"],
-                            "type": record["type"],
-                            "sport": record["sport"],
-                            "question": record["question"],
-                            "answer": record["answer"],
-                            "ans_cls": record["ans_cls"],
-                            "prediction_raw": prediction,
-                            "model_name_or_path": args.model_name_or_path,
-                            "adapter_path": str(args.adapter_path) if args.adapter_path else None,
-                            "prompt_style": args.prompt_style,
-                        }
-                        output_handle.write(json.dumps(result, ensure_ascii=False) + "\n")
-                    output_handle.flush()
-                    progress.update(len(batch_records))
-                    progress.set_postfix(
-                        tokens=input_token_count,
-                        videos=f"{video_index}/{len(video_groups)}",
-                    )
-                del cached_video
-                del cached_video_features
+        with tqdm(
+            total=len(records),
+            desc="Sports-QA inference",
+            unit="qa",
+            dynamic_ncols=True,
+        ) as progress:
+            for samples, loader_wait_ms in iter_gpu_batches(
+                dataloader, args.batch_size
+            ):
+                batch = prepare_batch(samples, processor, pipeline_config)
+
+                pin_started = time.perf_counter()
+                if args.pin_memory and torch.cuda.is_available():
+                    batch.pin_memory()
+                pin_memory_ms = (time.perf_counter() - pin_started) * 1000
+
+                h2d_started = time.perf_counter()
+                inputs = move_inputs_to_device(batch.inputs, model.device)
+                h2d_enqueue_ms = (time.perf_counter() - h2d_started) * 1000
+
+                generation_started = time.perf_counter()
+                with torch.inference_mode():
+                    generated_ids = model.generate(**inputs, **kwargs)
+                generate_ms = (time.perf_counter() - generation_started) * 1000
+
+                predictions = decode_predictions(processor, inputs, generated_ids)
+                write_predictions(output_handle, batch, predictions, args)
+                timings.add(
+                    batch, loader_wait_ms, pin_memory_ms, h2d_enqueue_ms, generate_ms,
+                )
+                progress.update(len(batch.records))
+                progress.set_postfix(tokens=max(batch.input_token_counts))
+    timings.print_summary()
 
 
 if __name__ == "__main__":

@@ -72,11 +72,20 @@ values. They are implementation choices, not claims about the original Qwen setu
 
 | Parameter | Current value | Effect and rationale |
 | --- | ---: | --- |
+| `batch_size` | `1` | GPU `model.generate()` batch size. It does not change the DataLoader task size: every CPU task is exactly one QA. |
 | `max_new_tokens` | `32` | Maximum generated Qwen tokens for one QA. Sports-QA answers are short, so this prevents verbose output without cutting ordinary zero-shot answers. It is not suitable for a CoT experiment; give that separately named experiment a larger generation budget. |
 | `video_frames` | `8` | Passed to the Qwen processor as `nframes`: eight decoded video frames represent each QA video. It balances temporal coverage, GPU memory, and visual-token length. The inference script requires an even value. |
 | `video_min_pixels` | `50176` (`224 x 224`) | Lower visual-resolution budget used by the Qwen video processor. It prevents very small frames from being reduced below the fixed evaluation profile. |
 | `video_max_pixels` | `200704` (`448 x 448`) | Upper visual-resolution budget used by the Qwen video processor. It limits visual tokens and GPU memory while retaining more detail than the lower bound. |
-| `cache_video_features` | `false` | Disabled for formal evaluation because the experimental cross-batch visual-feature cache changed generated answers in the cache/no-cache equivalence check. |
+| `video_backend` | `torchcodec` | Strict CPU decoder selection. Startup fails with installation diagnostics if TorchCodec cannot load instead of silently selecting torchvision. |
+| `decoder_threads` | `2` | FFmpeg threads used by each TorchCodec worker. Keep `num_workers * decoder_threads` within the available CPU-core budget. |
+| `num_workers` | `4` | CPU workers that independently decode one QA at a time while the GPU generates the current batch. |
+| `prefetch_factor` | `2` | Individual decoded QAs queued per worker, not GPU batches. Increase only when CPU and host memory have headroom. |
+| `persistent_workers` | `false` | Workers are not retained because this runner performs one offline pass. |
+| `use_fast_processor` | `true` | Explicitly uses the Transformers fast processor, avoiding version-dependent default selection. |
+| `pin_memory` | `true` | Pins the completed processor batch in the main process before non-blocking GPU transfer. |
+| `timeout` | `120` | Maximum seconds to wait for the next individual decoded QA from the DataLoader. |
+| `multiprocessing_context` | `spawn` | Starts clean CPU worker processes and avoids inheriting initialized CUDA state. |
 | `judge_batch_size` | `100` | Number of independent fallback QA judgments included in one DeepSeek request. Exact canonical predictions bypass DeepSeek. |
 | `judge_max_in_flight_batches` | `4` | At most four 100-QA judge requests are in flight at once. It reduces idle network time without changing the QA grouping or output file name. Start at `2` if the endpoint responds with rate-limit or timeout errors. |
 | `judge_rate_limit_rpm` | `1000` | SiliconFlow L0 account RPM ceiling. Every DeepSeek request, including retries and single-item fallbacks, shares this process-wide limit. |
