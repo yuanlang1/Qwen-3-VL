@@ -48,6 +48,30 @@ If downloaded video filenames do not follow metadata IDs, pass
 `--video-index /data/sportsqa/video_index.json`. The index maps a metadata video
 ID to a path relative to `/data/sportsqa/videos`.
 
+### Validate videos before training
+
+Before an SFT run, create an auditable filtered annotation. The validator always
+checks required fields and video-file existence; `--verify-video` additionally
+uses `ffprobe` to require a readable video stream. It does not change the source
+annotation.
+
+```bash
+python tools/validate_sportsqa.py \
+  --annotation /data/sportsqa/prepared/train.json \
+  --video-root /data/sportsqa/videos \
+  --output-dir /data/sportsqa/validation \
+  --verify-video
+```
+
+This writes `valid_train.json`, `quarantined_train.jsonl`, and
+`validation_summary_train.json`. Point `SPORTSQA_TRAIN["annotation_path"]` to
+the valid annotation only after reviewing the quarantine file. Add
+`--fail-on-invalid` in CI when any quarantined sample should block the run.
+
+During training, a sample that still cannot be read is retried three times and
+then raises an error with its dataset index, `qa_id`, video path, and root cause.
+It is never replaced with a neighbouring QA record.
+
 ## 3. Validation-only zero-shot baselines
 
 First edit `video_frames`, `video_min_pixels`, and `video_max_pixels` at the
@@ -64,20 +88,19 @@ bash scripts/sportsqa_eval.sh Qwen/Qwen2.5-VL-7B-Instruct sportsqa-qwen25vl-7b
 For a server smoke test, change `max_samples=0` to a small positive number in
 the same script. Select one frame configuration by validation Macro-F1.
 
-The evaluator uses a DataLoader inference pipeline by default. Each QA is an
-independent sample, so repeated references to the same video are decoded again;
-there is no video or visual-feature cache. A DataLoader task always decodes exactly
-one QA. The main process collects those ordered decoded samples, runs the processor
-once, and sends up to `batch_size` samples to `model.generate()`. Therefore
-`batch_size` controls only the GPU batch and does not multiply the amount of work
-assigned to each CPU worker.
+The evaluator uses a DataLoader inference pipeline by default. Consecutive QAs for
+the same video form one CPU task: the video is decoded once, then expanded into its
+ordered QA samples. The main process runs the processor for each QA and sends up to
+`batch_size` samples to `model.generate()`. Therefore `batch_size` controls only the
+GPU batch and does not multiply the amount of work assigned to each CPU worker. There
+is no visual-feature cache, so the model still encodes the video once per QA.
 
 The parameters are separated by stage:
 
 | Stage | Parameters | Meaning |
 | --- | --- | --- |
 | GPU generation | `batch_size`, `max_new_tokens` | Number of decoded QAs per model call and output length |
-| CPU decode/DataLoader | `video_backend`, `decoder_threads`, `num_workers`, `prefetch_factor`, `persistent_workers`, `timeout`, `multiprocessing_context` | Decoder implementation, CPU concurrency, and number of individual decoded QAs queued per worker |
+| CPU decode/DataLoader | `video_backend`, `decoder_threads`, `num_workers`, `prefetch_factor`, `persistent_workers`, `timeout`, `multiprocessing_context` | Decoder implementation, CPU concurrency, and number of decoded video groups queued per worker |
 | Main-process processor/H2D | `use_fast_processor`, `pin_memory` | Processor implementation and pinned-memory transfer preparation |
 | Video sampling | `video_frames`, `video_min_pixels`, `video_max_pixels` | Frame count and visual token budget |
 

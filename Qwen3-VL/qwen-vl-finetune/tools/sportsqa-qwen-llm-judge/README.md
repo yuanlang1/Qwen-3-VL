@@ -13,8 +13,8 @@ reproduction of Yang et al., which used GPT-4 as the judge. Keep the metric file
 
 ## Setup
 
-Run from `qwen-vl-finetune`. Replace the three path placeholders and the Key placeholder
-near the top of `scripts/sft-3b-llm-judge/run_table10_qwen.sh`:
+Run from `qwen-vl-finetune`. Configure the three server-local paths near the top of
+`scripts/sft-3b-llm-judge/run_table10_qwen.sh`, then export the judge key:
 
 ```bash
 export SILICONFLOW_API_KEY='YOUR_SILICONFLOW_API_KEY'
@@ -25,6 +25,16 @@ is never accepted as a command-line argument and is not stored in prediction, ju
 or metric artifacts.
 
 ## Runs
+
+The profile launchers below keep output files separate for each frame/pixel budget.
+Use the matching full-run script for `--judge-only` after an inference-only run.
+
+| Profile | Frames | `video_max_pixels` | Full run | Inference only |
+| --- | ---: | ---: | --- | --- |
+| `8f-448` | 8 | 200704 | `scripts/sft-3b-llm-judge/eval-3b-8f-448.sh` | `scripts/sportsqa-3b-inference/infer-3b-8f-448.sh` |
+| `16f-448` | 16 | 200704 | `scripts/sft-3b-llm-judge/eval-3b-16f-448.sh` | `scripts/sportsqa-3b-inference/infer-3b-16f-448.sh` |
+| `8f-634` | 8 | 401408 | `scripts/sft-3b-llm-judge/eval-3b-8f-634.sh` | `scripts/sportsqa-3b-inference/infer-3b-8f-634.sh` |
+| `16f-634` | 16 | 401408 | `scripts/sft-3b-llm-judge/eval-3b-16f-634.sh` | `scripts/sportsqa-3b-inference/infer-3b-16f-634.sh` |
 
 Start with a small end-to-end smoke test by changing `max_samples` in
 `scripts/sft-3b-llm-judge/run_table10_qwen.sh`. Then restore it to `0` for the
@@ -59,6 +69,19 @@ exact-match details, then resumes any missing LLM judgments. It fails explicitly
 prediction file is absent; the judge itself still checks that it covers the requested
 manifest before making API calls.
 
+## Inference only
+
+For an offline prediction run without exact scoring, LLM judging, or an API key, use
+the separate runner. Its prediction path and `yang-0s` file name match the judge-only
+runner, so a completed `RUN_NAME` can later be passed directly to `--judge-only`.
+It resumes an interrupted JSONL file by default and starts with a conservative
+memory-limited profile (`batch_size=2`, one worker, one prefetched video group, no pinned memory).
+
+```bash
+bash scripts/sportsqa-3b-inference/infer_sportsqa_3b.sh \
+  /home/user/model/Qwen/Qwen2.5-VL-3B-Instruct RUN_NAME
+```
+
 The runner uses `yang-0s`, which passes only the original question alongside the video.
 `infer_sportsqa.py --prompt-style yang-cot` is available for a separately labelled CoT
 ablation; it is not part of the Qwen rows in Sports-QA Table 10.
@@ -72,19 +95,19 @@ values. They are implementation choices, not claims about the original Qwen setu
 
 | Parameter | Current value | Effect and rationale |
 | --- | ---: | --- |
-| `batch_size` | `1` | GPU `model.generate()` batch size. It does not change the DataLoader task size: every CPU task is exactly one QA. |
+| `batch_size` | `1` | GPU `model.generate()` batch size. It does not change the DataLoader task size: every CPU task is one contiguous video group. |
 | `max_new_tokens` | `32` | Maximum generated Qwen tokens for one QA. Sports-QA answers are short, so this prevents verbose output without cutting ordinary zero-shot answers. It is not suitable for a CoT experiment; give that separately named experiment a larger generation budget. |
-| `video_frames` | `8` | Passed to the Qwen processor as `nframes`: eight decoded video frames represent each QA video. It balances temporal coverage, GPU memory, and visual-token length. The inference script requires an even value. |
+| `video_frames` | `8` | Passed to the Qwen processor as `nframes`: eight decoded frames represent each video group. It balances temporal coverage, GPU memory, and visual-token length. The inference script requires an even value. |
 | `video_min_pixels` | `50176` (`224 x 224`) | Lower visual-resolution budget used by the Qwen video processor. It prevents very small frames from being reduced below the fixed evaluation profile. |
 | `video_max_pixels` | `200704` (`448 x 448`) | Upper visual-resolution budget used by the Qwen video processor. It limits visual tokens and GPU memory while retaining more detail than the lower bound. |
 | `video_backend` | `torchcodec` | Strict CPU decoder selection. Startup fails with installation diagnostics if TorchCodec cannot load instead of silently selecting torchvision. |
 | `decoder_threads` | `2` | FFmpeg threads used by each TorchCodec worker. Keep `num_workers * decoder_threads` within the available CPU-core budget. |
-| `num_workers` | `4` | CPU workers that independently decode one QA at a time while the GPU generates the current batch. |
-| `prefetch_factor` | `2` | Individual decoded QAs queued per worker, not GPU batches. Increase only when CPU and host memory have headroom. |
+| `num_workers` | `4` | CPU workers that independently decode one video group at a time while the GPU generates the current batch. |
+| `prefetch_factor` | `2` | Decoded video groups queued per worker, not GPU batches. Increase only when CPU and host memory have headroom. |
 | `persistent_workers` | `false` | Workers are not retained because this runner performs one offline pass. |
 | `use_fast_processor` | `true` | Explicitly uses the Transformers fast processor, avoiding version-dependent default selection. |
 | `pin_memory` | `true` | Pins the completed processor batch in the main process before non-blocking GPU transfer. |
-| `timeout` | `120` | Maximum seconds to wait for the next individual decoded QA from the DataLoader. |
+| `timeout` | `120` | Maximum seconds to wait for the next decoded video group from the DataLoader. |
 | `multiprocessing_context` | `spawn` | Starts clean CPU worker processes and avoids inheriting initialized CUDA state. |
 | `judge_batch_size` | `100` | Number of independent fallback QA judgments included in one DeepSeek request. Exact canonical predictions bypass DeepSeek. |
 | `judge_max_in_flight_batches` | `4` | At most four 100-QA judge requests are in flight at once. It reduces idle network time without changing the QA grouping or output file name. Start at `2` if the endpoint responds with rate-limit or timeout errors. |

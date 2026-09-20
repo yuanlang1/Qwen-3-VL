@@ -93,6 +93,10 @@ def work(sequence_id, qa_id, video_path="video.mp4"):
     )
 
 
+def video_work(*qa_items):
+    return pipeline.VideoWork(qa_items[0].video_path, qa_items)
+
+
 class SportsQADataLoaderTests(unittest.TestCase):
     def setUp(self):
         self.original_process_vision_info = pipeline.process_vision_info
@@ -101,7 +105,7 @@ class SportsQADataLoaderTests(unittest.TestCase):
     def tearDown(self):
         pipeline.process_vision_info = self.original_process_vision_info
 
-    def test_same_video_is_decoded_for_each_qa_in_manifest_order(self):
+    def test_same_video_is_decoded_once_for_all_qa_in_manifest_order(self):
         calls = []
 
         def fake_process(_message, **kwargs):
@@ -112,16 +116,16 @@ class SportsQADataLoaderTests(unittest.TestCase):
         pipeline.process_vision_info = fake_process
         config = pipeline_config()
         decoder = pipeline.SportsQADecoder(config)
-        samples = [decoder(work(0, 1)), decoder(work(1, 2))]
+        samples = decoder(video_work(work(0, 1), work(1, 2)))
         prepared = pipeline.prepare_batch(samples, self.processor, config)
 
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 1)
         self.assertEqual(prepared.sequence_ids, [0, 1])
         self.assertEqual([item["qa_id"] for item in prepared.records], [1, 2])
         processor_kwargs = self.processor.calls[0]
-        self.assertEqual(processor_kwargs["fps"], [1.0, 2.0])
+        self.assertEqual(processor_kwargs["fps"], [1.0, 1.0])
         self.assertEqual(
-            [float(video[0, 0]) for video in processor_kwargs["videos"]], [1.0, 2.0]
+            [float(video[0, 0]) for video in processor_kwargs["videos"]], [1.0, 1.0]
         )
         self.assertFalse(processor_kwargs["do_resize"])
         self.assertFalse(processor_kwargs["do_sample_frames"])
@@ -141,7 +145,7 @@ class SportsQADataLoaderTests(unittest.TestCase):
         pipeline.process_vision_info = fake_process
         config = pipeline_config(model_type="qwen3_vl")
         decoder = pipeline.SportsQADecoder(config)
-        samples = [decoder(work(0, 1)), decoder(work(1, 2))]
+        samples = decoder(video_work(work(0, 1), work(1, 2)))
         pipeline.prepare_batch(samples, self.processor, config)
 
         self.assertEqual(
@@ -151,16 +155,11 @@ class SportsQADataLoaderTests(unittest.TestCase):
                     "return_video_kwargs": True,
                     "image_patch_size": 16,
                     "return_video_metadata": True,
-                },
-                {
-                    "return_video_kwargs": True,
-                    "image_patch_size": 16,
-                    "return_video_metadata": True,
-                },
+                }
             ],
         )
         processor_kwargs = self.processor.calls[0]
-        self.assertEqual(processor_kwargs["video_metadata"], [{"clip": 1}, {"clip": 2}])
+        self.assertEqual(processor_kwargs["video_metadata"], [{"clip": 1}, {"clip": 1}])
         self.assertNotIn("fps", processor_kwargs)
 
     def test_decode_error_keeps_exact_qa_context(self):
@@ -170,9 +169,11 @@ class SportsQADataLoaderTests(unittest.TestCase):
         pipeline.process_vision_info = broken_process
         with self.assertRaisesRegex(
             pipeline.VideoPreparationError,
-            r"video decode.*sequence_id=7.*qa_id=11.*broken\.mp4.*corrupt video",
+            r"video decode.*sequence_id=7.*qa_id=11.*sequence_id=8.*qa_id=12.*broken\.mp4.*corrupt video",
         ):
-            pipeline.SportsQADecoder(pipeline_config())(work(7, 11, "broken.mp4"))
+            pipeline.SportsQADecoder(pipeline_config())(
+                video_work(work(7, 11, "broken.mp4"), work(8, 12, "broken.mp4"))
+            )
 
     def test_processor_error_lists_every_qa_in_the_batch(self):
         class BrokenProcessor(FakeProcessor):
@@ -187,7 +188,7 @@ class SportsQADataLoaderTests(unittest.TestCase):
         )
         config = pipeline_config()
         decoder = pipeline.SportsQADecoder(config)
-        samples = [decoder(work(0, 1)), decoder(work(1, 2))]
+        samples = decoder(video_work(work(0, 1), work(1, 2)))
         with self.assertRaisesRegex(
             pipeline.VideoPreparationError,
             r"processor preparation.*sequence_id=0, qa_id=1.*sequence_id=1, qa_id=2",
@@ -203,15 +204,19 @@ class SportsQADataLoaderTests(unittest.TestCase):
         )
         config = pipeline_config(max_context=6, max_new_tokens=2)
         decoder = pipeline.SportsQADecoder(config)
-        samples = [decoder(work(0, 1)), decoder(work(1, 2))]
+        samples = decoder(video_work(work(0, 1), work(1, 2)))
         with self.assertRaisesRegex(
             pipeline.VideoPreparationError,
             r"context validation.*sequence_id=1.*qa_id=2.*5 input tokens",
         ):
             pipeline.prepare_batch(samples, self.processor, config)
 
-    def test_dataloader_prefetches_single_samples_not_gpu_batches(self):
-        items = [work(0, 1), work(1, 2), work(2, 3)]
+    def test_dataloader_prefetches_video_groups_not_gpu_batches(self):
+        items = [
+            video_work(work(0, 1)),
+            video_work(work(1, 2)),
+            video_work(work(2, 3)),
+        ]
         dataset = pipeline.SportsQADataset(items)
         args = SimpleNamespace(
             batch_size=2,
@@ -228,26 +233,52 @@ class SportsQADataLoaderTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            [dataset[index].sequence_id for index in range(len(dataset))], [0, 1, 2]
+            [dataset[index].qa_items[0].sequence_id for index in range(len(dataset))],
+            [0, 1, 2],
         )
         self.assertIsNone(loader.batch_size)
         self.assertIsNone(loader.batch_sampler)
         self.assertEqual(loader.prefetch_factor, 2)
         self.assertFalse(loader.persistent_workers)
 
-    def test_work_plan_validates_paths_without_grouping(self):
+    def test_work_plan_groups_contiguous_video_records(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             video = root / "video.mp4"
             video.write_bytes(b"video")
-            items = pipeline.build_qa_work_items(
+            items = pipeline.build_video_work_items(
                 [record(1, "video.mp4"), record(2, "video.mp4")], root,
             )
 
-            self.assertEqual([item.sequence_id for item in items], [0, 1])
-            self.assertEqual([item.video_path for item in items], [video, video])
+            self.assertEqual(len(items), 1)
+            self.assertEqual(
+                [item.sequence_id for item in items[0].qa_items], [0, 1]
+            )
+            self.assertEqual(items[0].video_path, video)
             with self.assertRaisesRegex(FileNotFoundError, r"sequence_id=0.*qa_id=3"):
-                pipeline.build_qa_work_items([record(3, "missing.mp4")], root)
+                pipeline.build_video_work_items([record(3, "missing.mp4")], root)
+
+    def test_work_plan_does_not_reorder_noncontiguous_videos(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("first.mp4", "second.mp4"):
+                (root / name).write_bytes(b"video")
+            items = pipeline.build_video_work_items(
+                [
+                    record(1, "first.mp4"),
+                    record(2, "second.mp4"),
+                    record(3, "first.mp4"),
+                ],
+                root,
+            )
+
+        self.assertEqual(
+            [item.video_path.name for item in items],
+            ["first.mp4", "second.mp4", "first.mp4"],
+        )
+        self.assertEqual(
+            [item.qa_items[0].sequence_id for item in items], [0, 1, 2]
+        )
 
     def test_tensor_device_move_preserves_nested_inputs(self):
         inputs = {

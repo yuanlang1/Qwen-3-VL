@@ -23,7 +23,7 @@ video_min_pixels=50176
 video_max_pixels=200704
 max_samples=0
 
-# CPU DataLoader/decoder parameters. Each prefetched item is one decoded QA.
+# CPU DataLoader/decoder parameters. Each prefetched item is one decoded video group.
 video_backend=torchcodec
 decoder_threads=2
 num_workers=4

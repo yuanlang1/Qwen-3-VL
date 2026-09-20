@@ -182,7 +182,7 @@ class SportsQAInferenceTests(unittest.TestCase):
             {"skip_special_tokens": True, "clean_up_tokenization_spaces": False},
         )
 
-    def test_legacy_group_and_cache_paths_are_absent(self):
+    def test_legacy_gpu_feature_cache_paths_are_absent(self):
         tools_dir = Path(__file__).parents[1] / "tools"
         source = (tools_dir / "infer_sportsqa.py").read_text(encoding="utf-8")
         source += (tools_dir / "sportsqa_dataloader.py").read_text(encoding="utf-8")
@@ -190,7 +190,6 @@ class SportsQAInferenceTests(unittest.TestCase):
         for legacy_name in (
             "cache-video-features",
             "CachedVideoFeatures",
-            "VideoGroupWork",
             "OrderedBatchBuffer",
             "CudaPrefetcher",
             "reuse_cached_video_features",

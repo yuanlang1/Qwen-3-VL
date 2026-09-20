@@ -31,10 +31,9 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_root=$(CDPATH= cd -- "${script_dir}/../.." && pwd)
 judge_dir=${project_root}/tools/sportsqa-qwen-llm-judge
 
-# Replace this placeholder only in the server-local copy. Do not commit a real key.
-export SILICONFLOW_API_KEY='YOUR_SILICONFLOW_API_KEY'
-if [[ "${SILICONFLOW_API_KEY}" == 'YOUR_SILICONFLOW_API_KEY' ]]; then
-    echo "Replace SILICONFLOW_API_KEY in ${script_dir}/run_table10_qwen.sh." >&2
+# The semantic judge reads its key from the environment. Do not write it here.
+if [ -z "${SILICONFLOW_API_KEY:-}" ]; then
+    echo "Set SILICONFLOW_API_KEY in the environment before running this script." >&2
     exit 2
 fi
 
@@ -62,13 +61,14 @@ batch_size=1
 max_new_tokens=32
 
 # Video sampling parameters
-video_frames=8
-video_min_pixels=50176
-video_max_pixels=200704
+video_frames=${SPORTSQA_VIDEO_FRAMES:-8}
+video_min_pixels=${SPORTSQA_VIDEO_MIN_PIXELS:-50176}
+video_max_pixels=${SPORTSQA_VIDEO_MAX_PIXELS:-200704}
 prompt_style=yang-0s
 max_samples=0
+profile_suffix=${SPORTSQA_EVAL_PROFILE:+_${SPORTSQA_EVAL_PROFILE}}
 
-# CPU DataLoader/decoder parameters. Each prefetched item is one decoded QA.
+# CPU DataLoader/decoder parameters. Each prefetched item is one decoded video group.
 video_backend=torchcodec
 decoder_threads=2
 num_workers=4
@@ -98,12 +98,12 @@ judge_retry_backoff_seconds=15
 judge_max_retry_backoff_seconds=300
 
 run_root=${output_root}/${run_name}
-prediction_file=${run_root}/predictions/${split}_yang-0s.jsonl
-exact_metric_file=${run_root}/metrics/${split}_yang-0s_exact.json
-exact_details_file=${run_root}/metrics/${split}_yang-0s_exact_details.jsonl
+prediction_file=${run_root}/predictions/${split}_${prompt_style}${profile_suffix}.jsonl
+exact_metric_file=${run_root}/metrics/${split}_${prompt_style}${profile_suffix}_exact.json
+exact_details_file=${run_root}/metrics/${split}_${prompt_style}${profile_suffix}_exact_details.jsonl
 judge_label=hybrid-rule-exact-deepseek-v3-compact-no-thinking-batch${judge_batch_size}
-judgment_file=${run_root}/judgments/${split}_yang-0s_${judge_label}.jsonl
-semantic_metric_file=${run_root}/metrics/${split}_yang-0s_${judge_label}.json
+judgment_file=${run_root}/judgments/${split}_${prompt_style}${profile_suffix}_${judge_label}.jsonl
+semantic_metric_file=${run_root}/metrics/${split}_${prompt_style}${profile_suffix}_${judge_label}.json
 manifest=${prepared_root}/${split}_manifest.json
 
 if [ "${judge_only}" = false ]; then

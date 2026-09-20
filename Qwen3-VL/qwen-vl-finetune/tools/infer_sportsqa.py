@@ -20,7 +20,7 @@ from sportsqa_dataloader import (
     PreparedBatch,
     SportsQADecoder,
     SportsQADataset,
-    build_qa_work_items,
+    build_video_work_items,
     configure_video_processor,
     make_dataloader,
     move_inputs_to_device,
@@ -64,7 +64,7 @@ def parse_args() -> argparse.Namespace:
         "--batch-size",
         type=int,
         default=1,
-        help="GPU model.generate batch size; DataLoader tasks always contain one QA.",
+        help="GPU model.generate batch size; DataLoader tasks contain one video group.",
     )
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -94,7 +94,7 @@ def parse_args() -> argparse.Namespace:
         "--prefetch-factor",
         type=int,
         default=2,
-        help="Individual decoded QAs prefetched per worker.",
+        help="Decoded video groups prefetched per worker.",
     )
     parser.add_argument(
         "--persistent-workers",
@@ -118,7 +118,7 @@ def parse_args() -> argparse.Namespace:
         "--timeout",
         type=float,
         default=120,
-        help="Maximum seconds to wait for the next decoded QA.",
+        help="Maximum seconds to wait for the next decoded video group.",
     )
     parser.add_argument(
         "--multiprocessing-context",
@@ -329,7 +329,7 @@ def main() -> None:
             "Sports-QA inference: no pending QAs; existing predictions are unchanged."
         )
         return
-    work_items = build_qa_work_items(records, args.video_root)
+    work_items = build_video_work_items(records, args.video_root)
     os.environ["TORCHCODEC_NUM_THREADS"] = str(args.decoder_threads)
     video_backend = configure_video_backend(args.video_backend)
 
@@ -365,7 +365,7 @@ def main() -> None:
     dataloader = make_dataloader(dataset, decoder, args)
     print(
         f"Video sampling: model_type={model.config.model_type}, frames={args.video_frames}; "
-        f"prompt_style={args.prompt_style}; {len(records)} independent QAs; "
+        f"prompt_style={args.prompt_style}; {len(records)} QAs in {len(work_items)} video groups; "
         f"gpu_batch_size={args.batch_size}; video_backend={video_backend}, "
         f"decoder_threads={args.decoder_threads}; num_workers={args.num_workers}, "
         f"prefetch_factor={args.prefetch_factor} samples/worker"
@@ -383,7 +383,8 @@ def main() -> None:
             dynamic_ncols=True,
         ) as progress:
             for samples, loader_wait_ms in iter_gpu_batches(
-                dataloader, args.batch_size
+                (sample for video_samples in dataloader for sample in video_samples),
+                args.batch_size,
             ):
                 batch = prepare_batch(samples, processor, pipeline_config)
 

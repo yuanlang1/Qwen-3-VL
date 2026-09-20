@@ -23,8 +23,13 @@ IMAGE_TOKEN_INDEX = 151655
 VIDEO_TOKEN_INDEX = 151656
 DEFAULT_IMAGE_TOKEN = "<image>"
 DEFAULT_VIDEO_TOKEN = "<video>"
+SAMPLE_LOAD_RETRIES = 3
 
 local_rank = None
+
+
+class DataSampleError(RuntimeError):
+    """A training sample could not be read after its allowed retries."""
 
 
 def rank0_print(*args):
@@ -343,48 +348,40 @@ class LazySupervisedDataset(Dataset):
             return np.array([1] * len(self.list_data_dict))
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        num_base_retries = 3
-        num_final_retries = 30
+        source = self.list_data_dict[i]
+        record = source[0] if isinstance(source, list) and source else source
+        if isinstance(record, dict):
+            qa_id = record.get("qa_id", "<unknown>")
+            video = record.get("video", "<unknown>")
+            data_path = record.get("data_path", "")
+        else:
+            qa_id = video = "<unknown>"
+            data_path = ""
 
-        # try the current sample first
-        for attempt_idx in range(num_base_retries):
+        last_error = None
+        for attempt_idx in range(SAMPLE_LOAD_RETRIES):
             try:
-                sources = self.list_data_dict[i]
+                sources = source
                 if isinstance(sources, dict):
                     sources = [sources]
                 sample = self.item_fn(sources)
                 return sample
-            except Exception as e:
-                # sleep 1s in case it is a cloud disk issue
-                print(f"[Try #{attempt_idx}] Failed to fetch sample {i}. Exception:", e)
-                time.sleep(1)
-
-        # try other samples, in case it is file corruption issue
-        for attempt_idx in range(num_base_retries):
-            try:
-                next_index = min(i + 1, len(self.list_data_dict) - 1)
-                sources = self.list_data_dict[next_index]
-                if isinstance(sources, dict):
-                    sources = [sources]
-
-                sample = self.item_fn(sources)
-                return sample
-            except Exception as e:
-                # no need to sleep
+            except Exception as error:
+                last_error = error
                 print(
-                    f"[Try other #{attempt_idx}] Failed to fetch sample {next_index}. Exception:",
-                    e,
+                    f"[Try #{attempt_idx + 1}/{SAMPLE_LOAD_RETRIES}] Failed to fetch "
+                    f"sample {i} (qa_id={qa_id}, video={video}). Exception:",
+                    error,
                 )
-                pass
+                if attempt_idx + 1 < SAMPLE_LOAD_RETRIES:
+                    # A cloud-mounted file can become available shortly after a transient error.
+                    time.sleep(1)
 
-        try:
-            sources = self.list_data_dict[i]
-            if isinstance(sources, dict):
-                sources = [sources]
-            sample = self.item_fn(sources)
-            return sample
-        except Exception as e:
-            raise e
+        raise DataSampleError(
+            f"Failed to fetch training sample after {SAMPLE_LOAD_RETRIES} attempts "
+            f"(dataset_index={i}, qa_id={qa_id}, video={video}, data_path={data_path}). "
+            f"Last error: {last_error}"
+        ) from last_error
 
     def _get_item(self, sources) -> Dict[str, torch.Tensor]:
         data_dict = preprocess_qwen_visual(

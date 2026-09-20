@@ -36,6 +36,14 @@ class QAWork:
     record: Dict[str, Any]
 
 
+@dataclass(frozen=True)
+class VideoWork:
+    """One contiguous video and its manifest-ordered QA items."""
+
+    video_path: Path
+    qa_items: Sequence[QAWork]
+
+
 @dataclass
 class DecodedSample:
     """One QA after CPU video decode, before model input preparation."""
@@ -109,10 +117,12 @@ def resolve_video_path(video_root: Path, record: Dict[str, Any]) -> Path:
     return path if path.is_absolute() else video_root / path
 
 
-def build_qa_work_items(
+def build_video_work_items(
     records: Iterable[Dict[str, Any]], video_root: Path
-) -> List[QAWork]:
-    work_items = []
+) -> List[VideoWork]:
+    video_work_items = []
+    current_video_path = None
+    current_qa_items = []
     for sequence_id, record in enumerate(records):
         video_path = resolve_video_path(video_root, record)
         if not video_path.is_file():
@@ -120,16 +130,24 @@ def build_qa_work_items(
                 f"Missing video for sequence_id={sequence_id}, "
                 f"qa_id={record['qa_id']}: {video_path}"
             )
-        work_items.append(
+        if current_video_path is not None and video_path != current_video_path:
+            video_work_items.append(
+                VideoWork(current_video_path, tuple(current_qa_items))
+            )
+            current_qa_items = []
+        current_video_path = video_path
+        current_qa_items.append(
             QAWork(sequence_id=sequence_id, video_path=video_path, record=record)
         )
-    return work_items
+    if current_video_path is not None:
+        video_work_items.append(VideoWork(current_video_path, tuple(current_qa_items)))
+    return video_work_items
 
 
-def build_video_content(work: QAWork, config: PipelineConfig) -> Dict[str, Any]:
+def build_video_content(video_path: Path, config: PipelineConfig) -> Dict[str, Any]:
     return {
         "type": "video",
-        "video": str(work.video_path),
+        "video": str(video_path),
         "nframes": config.video_frames,
         "min_pixels": config.video_min_pixels,
         "max_pixels": config.video_max_pixels,
@@ -148,17 +166,23 @@ def build_message(work: QAWork, config: PipelineConfig) -> List[Dict[str, Any]]:
         {
             "role": "user",
             "content": [
-                build_video_content(work, config),
+                build_video_content(work.video_path, config),
                 {"type": "text", "text": prompt},
             ],
         }
     ]
 
 
-def _work_error(work: QAWork, stage: str, error: Exception) -> VideoPreparationError:
+def _work_error(
+    work_items: Sequence[QAWork], stage: str, error: Exception
+) -> VideoPreparationError:
+    context = "; ".join(
+        f"sequence_id={work.sequence_id}, qa_id={work.record['qa_id']}, "
+        f"video_path={work.video_path}"
+        for work in work_items
+    )
     return VideoPreparationError(
-        f"Sports-QA {stage} failed for sequence_id={work.sequence_id}, "
-        f"qa_id={work.record['qa_id']}, video_path={work.video_path}: {error}"
+        f"Sports-QA {stage} failed for [{context}]: {error}"
     )
 
 
@@ -170,35 +194,40 @@ def _sample_context(sample: DecodedSample) -> str:
 
 
 class SportsQADataset(Dataset):
-    """Map-style dataset whose items are independent QA records."""
+    """Map-style dataset whose items are contiguous video groups."""
 
-    def __init__(self, work_items: Sequence[QAWork]) -> None:
+    def __init__(self, work_items: Sequence[VideoWork]) -> None:
         self._work_items = list(work_items)
 
     def __len__(self) -> int:
         return len(self._work_items)
 
-    def __getitem__(self, index: int) -> QAWork:
+    def __getitem__(self, index: int) -> VideoWork:
         return self._work_items[index]
 
 
 class SportsQADecoder:
-    """Decode one QA video per DataLoader task."""
+    """Decode one video per DataLoader task, then expand it into QA samples."""
 
     def __init__(self, config: PipelineConfig) -> None:
         if config.model_type not in {"qwen2_5_vl", "qwen3_vl"}:
             raise ValueError(f"Unsupported Sports-QA model_type={config.model_type!r}")
         self._config = config
 
-    def __call__(self, work: QAWork) -> DecodedSample:
-        message = build_message(work, self._config)
+    def __call__(self, work: VideoWork) -> List[DecodedSample]:
         started = time.perf_counter()
         try:
             process_kwargs: Dict[str, Any] = {"return_video_kwargs": True}
             if self._config.model_type == "qwen3_vl":
                 process_kwargs.update(image_patch_size=16, return_video_metadata=True)
             images, decoded_videos, video_kwargs = process_vision_info(
-                message, **process_kwargs
+                [
+                    {
+                        "role": "user",
+                        "content": [build_video_content(work.video_path, self._config)],
+                    }
+                ],
+                **process_kwargs,
             )
             if images is not None or decoded_videos is None or len(decoded_videos) != 1:
                 raise ValueError("Expected exactly one decoded video and no images")
@@ -214,17 +243,21 @@ class SportsQADecoder:
                     raise ValueError("Expected one sampled fps value")
                 sampled_fps = float(fps[0])
         except Exception as error:
-            raise _work_error(work, "video decode", error) from error
+            raise _work_error(work.qa_items, "video decode", error) from error
 
-        return DecodedSample(
-            sequence_id=work.sequence_id,
-            record=work.record,
-            message=message,
-            video=video,
-            video_metadata=video_metadata,
-            sampled_fps=sampled_fps,
-            decode_ms=(time.perf_counter() - started) * 1000,
-        )
+        decode_ms = (time.perf_counter() - started) * 1000 / len(work.qa_items)
+        return [
+            DecodedSample(
+                sequence_id=qa_work.sequence_id,
+                record=qa_work.record,
+                message=build_message(qa_work, self._config),
+                video=video,
+                video_metadata=video_metadata,
+                sampled_fps=sampled_fps,
+                decode_ms=decode_ms,
+            )
+            for qa_work in work.qa_items
+        ]
 
 
 def prepare_batch(
@@ -284,7 +317,7 @@ def prepare_batch(
                     video_path=Path(sample.message[0]["content"][0]["video"]),
                     record=sample.record,
                 )
-                raise _work_error(work, "context validation", error)
+                raise _work_error([work], "context validation", error)
 
     return PreparedBatch(
         sequence_ids=[sample.sequence_id for sample in samples],
@@ -305,7 +338,7 @@ def initialize_worker(_: int, decoder_threads: int) -> None:
 def make_dataloader(
     dataset: SportsQADataset, decoder: SportsQADecoder, args: Any
 ) -> DataLoader:
-    """Prefetch individual decoded QAs; GPU batching happens in the main process."""
+    """Prefetch decoded video groups; GPU batching happens in the main process."""
     return DataLoader(
         dataset,
         batch_size=None,
