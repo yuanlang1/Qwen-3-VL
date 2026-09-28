@@ -21,7 +21,7 @@ max_new_tokens=32
 video_frames=8
 video_min_pixels=50176
 video_max_pixels=200704
-max_samples=0
+sample_num=0
 
 # CPU DataLoader/decoder parameters. Each prefetched item is one decoded video group.
 video_backend=torchcodec
@@ -76,8 +76,8 @@ infer_args="
 if [ -n "${adapter_path}" ]; then
     infer_args="${infer_args} --adapter-path ${adapter_path}"
 fi
-if [ "${max_samples}" -gt 0 ]; then
-    infer_args="${infer_args} --limit ${max_samples}"
+if [ "${sample_num}" -gt 0 ]; then
+    infer_args="${infer_args} --limit ${sample_num}"
 fi
 if [ "${persistent_workers}" = true ]; then
     infer_args="${infer_args} --persistent-workers"
@@ -99,8 +99,8 @@ eval_args="
     --output-file ${metric_file} \
     --details-file ${details_file}"
 
-if [ "${max_samples}" -gt 0 ]; then
-    eval_args="${eval_args} --limit ${max_samples}"
+if [ "${sample_num}" -gt 0 ]; then
+    eval_args="${eval_args} --limit ${sample_num}"
 fi
 
 python tools/eval_sportsqa.py ${eval_args}

@@ -85,7 +85,7 @@ bash scripts/sportsqa_eval.sh Qwen/Qwen3-VL-4B-Instruct sportsqa-qwen3vl-4b
 bash scripts/sportsqa_eval.sh Qwen/Qwen2.5-VL-7B-Instruct sportsqa-qwen25vl-7b
 ```
 
-For a server smoke test, change `max_samples=0` to a small positive number in
+For a server smoke test, change `sample_num=0` to a small positive number in
 the same script. Select one frame configuration by validation Macro-F1.
 
 The evaluator uses a DataLoader inference pipeline by default. Consecutive QAs for

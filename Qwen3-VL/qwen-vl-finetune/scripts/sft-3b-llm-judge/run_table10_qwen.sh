@@ -31,11 +31,14 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_root=$(CDPATH= cd -- "${script_dir}/../.." && pwd)
 judge_dir=${project_root}/tools/sportsqa-qwen-llm-judge
 
-# The semantic judge reads its key from the environment. Do not write it here.
-if [ -z "${SILICONFLOW_API_KEY:-}" ]; then
-    echo "Set SILICONFLOW_API_KEY in the environment before running this script." >&2
+# Add accounts to this list only in the server-local copy. Do not commit real tokens.
+# All accounts must use the same SiliconFlow endpoint and judge model.
+judge_account_pool_json='[{"id":"siliconflow-1","api_key":"YOUR_SILICONFLOW_API_KEY"}]'
+if [[ "${judge_account_pool_json}" == *'YOUR_SILICONFLOW_API_KEY'* ]]; then
+    echo "Set judge_account_pool_json in ${script_dir}/run_table10_qwen.sh before running this script." >&2
     exit 2
 fi
+export SILICONFLOW_ACCOUNT_POOL_JSON="${judge_account_pool_json}"
 
 # Replace these explicit placeholders before running on the server.
 prepared_root=/home/user/data/sportsqa_prepared
@@ -65,8 +68,13 @@ video_frames=${SPORTSQA_VIDEO_FRAMES:-8}
 video_min_pixels=${SPORTSQA_VIDEO_MIN_PIXELS:-50176}
 video_max_pixels=${SPORTSQA_VIDEO_MAX_PIXELS:-200704}
 prompt_style=yang-0s
-max_samples=0
+sample_num=${SPORTSQA_SAMPLE_NUM:-0}
 profile_suffix=${SPORTSQA_EVAL_PROFILE:+_${SPORTSQA_EVAL_PROFILE}}
+
+if ! [[ "${sample_num}" =~ ^[0-9]+$ ]]; then
+    echo "sample_num must be a non-negative integer (0 means all samples)." >&2
+    exit 2
+fi
 
 # CPU DataLoader/decoder parameters. Each prefetched item is one decoded video group.
 video_backend=torchcodec
@@ -81,8 +89,7 @@ pin_memory=true
 timeout=120
 multiprocessing_context=spawn
 
-# SiliconFlow semantic judge. The API key is read only by the judge from
-# SILICONFLOW_API_KEY and is never passed on the command line or written to disk.
+# SiliconFlow semantic judge. RPM and TPM limits apply independently to each account.
 judge_model=deepseek-ai/DeepSeek-V3
 judge_batch_size=100
 judge_max_tokens=4096
@@ -101,7 +108,7 @@ run_root=${output_root}/${run_name}
 prediction_file=${run_root}/predictions/${split}_${prompt_style}${profile_suffix}.jsonl
 exact_metric_file=${run_root}/metrics/${split}_${prompt_style}${profile_suffix}_exact.json
 exact_details_file=${run_root}/metrics/${split}_${prompt_style}${profile_suffix}_exact_details.jsonl
-judge_label=hybrid-rule-exact-deepseek-v3-compact-no-thinking-batch${judge_batch_size}
+judge_label=hybrid-rule-exact-yes-no-score-batch${judge_batch_size}
 judgment_file=${run_root}/judgments/${split}_${prompt_style}${profile_suffix}_${judge_label}.jsonl
 semantic_metric_file=${run_root}/metrics/${split}_${prompt_style}${profile_suffix}_${judge_label}.json
 manifest=${prepared_root}/${split}_manifest.json
@@ -130,8 +137,8 @@ if [ "${judge_only}" = false ]; then
     if [ -n "${adapter_path}" ]; then
         infer_args+=(--adapter-path "${adapter_path}")
     fi
-    if [ "${max_samples}" -gt 0 ]; then
-        infer_args+=(--limit "${max_samples}")
+    if [ "${sample_num}" -gt 0 ]; then
+        infer_args+=(--limit "${sample_num}")
     fi
     if [ "${persistent_workers}" = true ]; then
         infer_args+=(--persistent-workers)
@@ -156,8 +163,8 @@ exact_args=(
     --output-file "${exact_metric_file}"
     --details-file "${exact_details_file}"
 )
-if [ "${max_samples}" -gt 0 ]; then
-    exact_args+=(--limit "${max_samples}")
+if [ "${sample_num}" -gt 0 ]; then
+    exact_args+=(--limit "${sample_num}")
 fi
 python "${project_root}/tools/eval_sportsqa.py" "${exact_args[@]}" > /dev/null
 
@@ -180,8 +187,8 @@ judge_args=(
     --max-retry-backoff-seconds "${judge_max_retry_backoff_seconds}"
     --resume
 )
-if [ "${max_samples}" -gt 0 ]; then
-    judge_args+=(--limit "${max_samples}")
+if [ "${sample_num}" -gt 0 ]; then
+    judge_args+=(--limit "${sample_num}")
 fi
 python "${judge_dir}/judge_sportsqa_semantic.py" "${judge_args[@]}"
 
@@ -191,7 +198,7 @@ summary_args=(
     --output-file "${semantic_metric_file}"
     --require-complete
 )
-if [ "${max_samples}" -gt 0 ]; then
-    summary_args+=(--limit "${max_samples}")
+if [ "${sample_num}" -gt 0 ]; then
+    summary_args+=(--limit "${sample_num}")
 fi
 python "${judge_dir}/summarize_sportsqa_semantic.py" "${summary_args[@]}"

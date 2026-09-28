@@ -13,16 +13,20 @@ reproduction of Yang et al., which used GPT-4 as the judge. Keep the metric file
 
 ## Setup
 
-Run from `qwen-vl-finetune`. Configure the three server-local paths near the top of
-`scripts/sft-3b-llm-judge/run_table10_qwen.sh`, then export the judge key:
+Run from `qwen-vl-finetune`. Configure the three server-local paths and `judge_account_pool_json`
+near the top of `scripts/sft-3b-llm-judge/run_table10_qwen.sh`:
+
+The default pool contains one account. Add objects with distinct `id` values to use more
+accounts; every account must use the same SiliconFlow endpoint and judge model. Replace
+tokens only in the server-local script and do not commit them. Tokens are not accepted on
+the command line or stored in prediction, judgment, or metric artifacts.
 
 ```bash
-export SILICONFLOW_API_KEY='YOUR_SILICONFLOW_API_KEY'
+judge_account_pool_json='[
+  {"id":"siliconflow-1","api_key":"TOKEN_1"},
+  {"id":"siliconflow-2","api_key":"TOKEN_2"}
+]'
 ```
-
-Replace the value only in the server-local script and do not commit a real key. The key
-is never accepted as a command-line argument and is not stored in prediction, judgment,
-or metric artifacts.
 
 ## Runs
 
@@ -36,8 +40,8 @@ Use the matching full-run script for `--judge-only` after an inference-only run.
 | `8f-634` | 8 | 401408 | `scripts/sft-3b-llm-judge/eval-3b-8f-634.sh` | `scripts/sportsqa-3b-inference/infer-3b-8f-634.sh` |
 | `16f-634` | 16 | 401408 | `scripts/sft-3b-llm-judge/eval-3b-16f-634.sh` | `scripts/sportsqa-3b-inference/infer-3b-16f-634.sh` |
 
-Start with a small end-to-end smoke test by changing `max_samples` in
-`scripts/sft-3b-llm-judge/run_table10_qwen.sh`. Then restore it to `0` for the
+Start with a small end-to-end smoke test by setting `sample_num` to a positive
+integer in a profile script (or exporting `SPORTSQA_SAMPLE_NUM`). Set it to `0` for the
 complete test split.
 
 ```bash
@@ -111,11 +115,11 @@ values. They are implementation choices, not claims about the original Qwen setu
 | `multiprocessing_context` | `spawn` | Starts clean CPU worker processes and avoids inheriting initialized CUDA state. |
 | `judge_batch_size` | `100` | Number of independent fallback QA judgments included in one DeepSeek request. Exact canonical predictions bypass DeepSeek. |
 | `judge_max_in_flight_batches` | `4` | At most four 100-QA judge requests are in flight at once. It reduces idle network time without changing the QA grouping or output file name. Start at `2` if the endpoint responds with rate-limit or timeout errors. |
-| `judge_rate_limit_rpm` | `1000` | SiliconFlow L0 account RPM ceiling. Every DeepSeek request, including retries and single-item fallbacks, shares this process-wide limit. |
-| `judge_rate_limit_tpm` | `50000` | SiliconFlow L0 account TPM ceiling. Each request conservatively reserves its UTF-8 input size plus `judge_max_tokens`. |
+| `judge_rate_limit_rpm` | `1000` | Per-account SiliconFlow L0 RPM ceiling. Retries and single-item fallbacks use the selected account's budget. |
+| `judge_rate_limit_tpm` | `50000` | Per-account SiliconFlow L0 TPM ceiling. Each request conservatively reserves its UTF-8 input size plus `judge_max_tokens`. |
 | `judge_rate_limit_safety_factor` | `0.8` | Uses 80% of the L0 ceilings (`800` RPM and `40,000` TPM) to leave account-level headroom. |
 | `judge_enable_thinking` | `false` | The judge explicitly disables Qwen3 thinking mode. This avoids hidden reasoning-token latency for a constrained JSON classification task. |
-| `judge_max_tokens` | `4096` | Maximum generated tokens for the *whole DeepSeek batch response*. The compact response contains only `qa_id`, `match`, and `score`; no reason is requested or stored. |
+| `judge_max_tokens` | `4096` | Maximum generated tokens for the whole judge batch response. The response contains only `qa_id`, `pred` (`yes`/`no`), and `score`; no reason is requested or stored. |
 | `judge_timeout_seconds` | `240` | Maximum time to wait for one DeepSeek response. The judge defaults to 60 seconds, which can be too short for a large batch and trigger an unnecessary single-item fallback. |
 
 Changing a video value, judge model, prompt, rule policy, or `judge_batch_size` changes
@@ -137,24 +141,20 @@ Each run writes beneath `${output_root}/${run_name}/`:
 The hybrid judge first reuses the exact-match detail file. When a prediction exactly
 normalizes to one answer-vocabulary label, it is recorded as `decision_source=rule_exact`;
 all other predictions are sent to DeepSeek as the fallback queue. The compact DeepSeek
-response requires only `qa_id`, `match`, and `score`. It sends up to 100 fallback QA items
+response requires only `qa_id`, `pred`, and `score`. It sends up to 100 fallback QA items
 per request and four requests in flight. A failed batch retries its items one by one. The
-JSONL records `decision_source`, `batch_id`, actual `batch_size`, `judge_mode`, requested
-batch size, the concurrent-request limit, and the configured rate ceilings. Worker
+JSONL records `decision_source`, `judge_account_id`, `batch_id`, actual `batch_size`,
+`judge_mode`, requested batch size, the concurrent-request limit, and the configured rate ceilings. Worker
 threads never write JSONL; the main thread writes and flushes only completed batches.
 Retries honor numeric `Retry-After` values when available; otherwise they use exponential
 backoff with a small random jitter.
 
-The online judge also uses a process-wide leaky-bucket limiter. Before every DeepSeek
-request, all workers share both the RPM and TPM schedule; the next request starts only
-after both budgets permit it. A `429` extends one shared cooldown, so workers that did
-not receive the error pause too. The limiter uses the configured ceilings with the safety
-factor and initially reserves UTF-8 input bytes plus `max_tokens`. After a successful
-response, it refunds the unused reservation using `usage.total_tokens`, allowing later
-requests to follow observed consumption rather than the generation cap. This prevents
+The online judge selects accounts round-robin, with separate RPM/TPM schedules per
+account. A `429` cools only the account that received it; a `401` or `403` disables that
+account for the current run. The selected account initially reserves UTF-8 input bytes
+plus `max_tokens` and refunds unused reservation from `usage.total_tokens`. This prevents
 bursty local traffic but cannot coordinate separate processes or other machines using the
-same account; run one online evaluator per account or lower the configured ceilings to
-reserve capacity for those callers.
+same account.
 
 The runner enables `--resume` for both inference and hybrid judging. Re-running the
 same command after an interruption preserves existing predictions, skips completed

@@ -1,0 +1,11 @@
+flowchart LR
+    A["Official protocol\nSports-QA split and metrics"] --> B["Prepare and validate\ntrain val test video data"]
+    B --> C["Zero-shot baseline\nQwen2.5-VL-3B on validation"]
+    C --> D["LoRA smoke run\nsmall sample and one epoch"]
+    D --> E["Validation experiments\nlearning rate and video budget"]
+    E --> F["Select checkpoint\nby validation Macro-F1"]
+    F --> G["One final test run\nexact scoring"]
+    G --> H["Optional semantic\nLLM Judge report"]
+
+    I["No test-set tuning"] -.-> E
+    J["No chain-of-thought\nonly final answer"] -.-> D

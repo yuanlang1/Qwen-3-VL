@@ -36,7 +36,13 @@ video_frames=${SPORTSQA_VIDEO_FRAMES:-8}
 video_min_pixels=${SPORTSQA_VIDEO_MIN_PIXELS:-50176}
 video_max_pixels=${SPORTSQA_VIDEO_MAX_PIXELS:-200704}
 prompt_style=yang-0s
+sample_num=${SPORTSQA_SAMPLE_NUM:-0}
 profile_suffix=${SPORTSQA_EVAL_PROFILE:+_${SPORTSQA_EVAL_PROFILE}}
+
+if ! [[ "${sample_num}" =~ ^[0-9]+$ ]]; then
+    echo "sample_num must be a non-negative integer (0 means all samples)." >&2
+    exit 2
+fi
 
 # CPU DataLoader/decoder parameters. Each prefetched item is one decoded video group.
 # Switch to torchcodec after it is installed and verified on the server.
@@ -84,6 +90,9 @@ infer_args=(
 
 if [ -n "${adapter_path}" ]; then
     infer_args+=(--adapter-path "${adapter_path}")
+fi
+if [ "${sample_num}" -gt 0 ]; then
+    infer_args+=(--limit "${sample_num}")
 fi
 if [ "${persistent_workers}" = true ]; then
     infer_args+=(--persistent-workers)
