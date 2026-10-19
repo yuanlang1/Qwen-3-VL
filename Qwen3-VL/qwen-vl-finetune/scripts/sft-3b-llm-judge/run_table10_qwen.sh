@@ -91,7 +91,6 @@ multiprocessing_context=spawn
 
 # SiliconFlow semantic judge. RPM and TPM limits apply independently to each account.
 judge_model=deepseek-ai/DeepSeek-V3
-judge_batch_size=100
 judge_max_tokens=4096
 judge_timeout_seconds=240
 judge_max_in_flight_batches=4
@@ -108,7 +107,7 @@ run_root=${output_root}/${run_name}
 prediction_file=${run_root}/predictions/${split}_${prompt_style}${profile_suffix}.jsonl
 exact_metric_file=${run_root}/metrics/${split}_${prompt_style}${profile_suffix}_exact.json
 exact_details_file=${run_root}/metrics/${split}_${prompt_style}${profile_suffix}_exact_details.jsonl
-judge_label=hybrid-rule-exact-yes-no-score-batch${judge_batch_size}
+judge_label=hybrid-rule-exact-yes-no-score-single
 judgment_file=${run_root}/judgments/${split}_${prompt_style}${profile_suffix}_${judge_label}.jsonl
 semantic_metric_file=${run_root}/metrics/${split}_${prompt_style}${profile_suffix}_${judge_label}.json
 manifest=${prepared_root}/${split}_manifest.json
@@ -176,7 +175,6 @@ judge_args=(
     --model "${judge_model}"
     --temperature 0
     --max-tokens "${judge_max_tokens}"
-    --batch-size "${judge_batch_size}"
     --timeout-seconds "${judge_timeout_seconds}"
     --max-in-flight-batches "${judge_max_in_flight_batches}"
     --rate-limit-rpm "${judge_rate_limit_rpm}"

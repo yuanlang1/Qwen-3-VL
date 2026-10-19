@@ -1,0 +1,8 @@
+# Install the PyTorch build that matches the CUDA runtime before this file.
+numpy>=1.26
+Pillow>=10.0
+decord>=0.6.0
+openai>=1.0
+open_clip_torch>=2.24
+torch>=2.2
+pytest>=8.0

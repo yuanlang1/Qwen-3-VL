@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sportsqa-offline-sampling"
+version = "0.1.0"
+description = "Offline query-aware non-uniform frame selection for Sports-QA"
+requires-python = ">=3.9"
+
+[project.scripts]
+sportsqa-offline-sampling = "sportsqa_offline_sampling.cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
