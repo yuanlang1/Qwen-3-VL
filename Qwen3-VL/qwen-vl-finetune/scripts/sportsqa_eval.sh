@@ -18,9 +18,10 @@ batch_size=1
 max_new_tokens=32
 
 # Video sampling parameters
-video_frames=8
-video_min_pixels=50176
-video_max_pixels=200704
+# Optional arguments 5-7 let the LoRA launchers reuse their training budget.
+video_frames=${5:-8}
+video_min_pixels=${7:-50176}
+video_max_pixels=${6:-200704}
 sample_num=0
 
 # CPU DataLoader/decoder parameters. Each prefetched item is one decoded video group.

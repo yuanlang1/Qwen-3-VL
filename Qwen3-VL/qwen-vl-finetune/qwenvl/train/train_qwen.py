@@ -136,7 +136,10 @@ def train(attn_implementation="flash_attention_2"):
     print(f'the initlized model is {model_args.model_name_or_path} the class is {model.__class__.__name__}')
     processor = AutoProcessor.from_pretrained(
         model_args.model_name_or_path,
+        **({"use_fast": True} if data_args.video_nframes is not None else {}),
     )
+    if data_args.video_nframes is not None:
+        processor.tokenizer.model_max_length = training_args.model_max_length
 
     if data_args.data_flatten or data_args.data_packing:
         replace_qwen2_vl_attention_class()

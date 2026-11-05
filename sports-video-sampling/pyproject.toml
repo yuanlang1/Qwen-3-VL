@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sports-video-sampling"
+version = "0.1.0"
+description = "Independent sports-aware query banks and Slow-Fast video sampling across datasets"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.26"]
+
+[project.optional-dependencies]
+video = ["Pillow>=10", "decord>=0.6"]
+queries = ["Pillow>=10", "decord>=0.6", "openai>=1"]
+scores = ["Pillow>=10", "decord>=0.6", "open_clip_torch>=2.24", "torch>=2.2"]
+test = ["pytest>=8", "Pillow>=10"]
+
+[project.scripts]
+sports-video-sampling = "sports_video_sampling.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

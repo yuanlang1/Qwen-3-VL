@@ -207,6 +207,7 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any
 def preprocess_qwen_visual(
     sources,
     processor,
+    data_args=None,
 ) -> Dict:
     if len(sources) != 1:
         raise ValueError(f"Expected 1 source, got {len(sources)}")
@@ -215,9 +216,32 @@ def preprocess_qwen_visual(
     base_path = Path(source.get("data_path", ""))
     messages = _build_messages(source, base_path)
 
-    full_result = processor.apply_chat_template(
-        messages, tokenize=True, return_dict=True, return_tensors="pt"
-    )
+    fixed_frames = getattr(data_args, "video_nframes", None)
+    if fixed_frames is not None:
+        from qwen_vl_utils import process_vision_info
+
+        for message in messages:
+            for content in message["content"]:
+                if content["type"] == "video":
+                    content.update(
+                        nframes=fixed_frames,
+                        min_pixels=data_args.video_min_pixels,
+                        max_pixels=data_args.video_max_pixels,
+                    )
+        images, videos = process_vision_info(messages)
+        if videos is not None and any(video.shape[0] != fixed_frames for video in videos):
+            raise ValueError(f"Expected exactly {fixed_frames} frames per video")
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False
+        )
+        full_result = processor(
+            text=[text], images=images, videos=videos, return_tensors="pt",
+            do_resize=False, do_sample_frames=False,
+        )
+    else:
+        full_result = processor.apply_chat_template(
+            messages, tokenize=True, return_dict=True, return_tensors="pt"
+        )
 
     input_ids = full_result["input_ids"]
     if isinstance(input_ids, list):
@@ -243,6 +267,15 @@ def preprocess_qwen_visual(
 
     full_result["labels"] = labels
     full_result["input_ids"] = input_ids
+    if fixed_frames is not None:
+        if input_ids.shape[-1] > processor.tokenizer.model_max_length:
+            raise ValueError(
+                f"Training sample has {input_ids.shape[-1]} tokens, exceeding "
+                f"model_max_length={processor.tokenizer.model_max_length}; "
+                "increase model_max_length to preserve video tokens and answer labels"
+            )
+        if not (labels != IGNORE_INDEX).any():
+            raise ValueError("Training sample has no supervised answer tokens")
     return full_result
 
 
@@ -262,6 +295,11 @@ class LazySupervisedDataset(Dataset):
             data_args, "video_min_total_pixels", 256 * 28 * 28
         )
         self.model_type = data_args.model_type
+        if data_args.video_nframes is not None:
+            if self.model_type != "qwen2.5vl":
+                raise ValueError("video_nframes currently supports Qwen2.5-VL only")
+            if data_args.video_nframes < 2 or data_args.video_nframes % 2:
+                raise ValueError("video_nframes must be an even integer of at least 2")
         if data_args.model_type == "qwen3vl":
             self.get_rope_index = get_rope_index_3
         elif data_args.model_type == "qwen2.5vl":
@@ -387,6 +425,7 @@ class LazySupervisedDataset(Dataset):
         data_dict = preprocess_qwen_visual(
             sources,
             self.processor,
+            self.data_args,
         )
 
         seq_len = data_dict["input_ids"][0].size(0)
@@ -402,10 +441,14 @@ class LazySupervisedDataset(Dataset):
             video_grid_thw = data_dict.get("video_grid_thw")
             if not isinstance(video_grid_thw, Sequence):
                 video_grid_thw = [video_grid_thw]
-            second_per_grid_ts = [
-                self.processor.video_processor.temporal_patch_size
-                / self.processor.video_processor.fps
-            ] * len(video_grid_thw)
+            if self.data_args.video_nframes is not None:
+                # No FPS override: use the processor's default temporal scale.
+                second_per_grid_ts = data_dict.pop("second_per_grid_ts")
+            else:
+                second_per_grid_ts = [
+                    self.processor.video_processor.temporal_patch_size
+                    / self.processor.video_processor.fps
+                ] * len(video_grid_thw)
         else:
             video_grid_thw = None
             second_per_grid_ts = None

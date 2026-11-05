@@ -23,6 +23,10 @@ class DataArguments:
     video_max_pixels: int = field(default=1024 * 28 * 28)
     video_min_pixels: int = field(default=256 * 28 * 28)
     video_fps: float = 2
+    video_nframes: Optional[int] = field(
+        default=None,
+        metadata={"help": "Fixed frames per video for Qwen2.5-VL; overrides FPS sampling."},
+    )
 
 
 @dataclass

@@ -1,0 +1,11 @@
+[
+  {
+    "id": "clip_001_question_1",
+    "video": "basketball/clip_001.mp4",
+    "conversations": [
+      {"from": "human", "value": "<video>\nWas contact made before the shot?"},
+      {"from": "gpt", "value": "Example training answer, excluded during normalization."}
+    ],
+    "metadata": {"dataset": "custom_sports", "split": "challenge"}
+  }
+]

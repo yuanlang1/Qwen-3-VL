@@ -1,0 +1,2 @@
+{"id":"clip_001_question_1","video":"basketball/clip_001.mp4","question":"Was contact made before the shot?","metadata":{"dataset":"custom_sports","split":"challenge"}}
+{"id":"clip_001_question_2","video":"basketball/clip_001.mp4","question":"Where is the ball immediately after the shot?","metadata":{"dataset":"custom_sports","split":"challenge"}}

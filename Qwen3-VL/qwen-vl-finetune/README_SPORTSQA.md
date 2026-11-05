@@ -126,6 +126,57 @@ comparing predictions. The pipeline remains compatible with `--resume`.
 
 ## 4. LoRA fine-tuning and checkpoint selection
 
+### Fixed-frame Qwen2.5-VL-3B profiles
+
+The launchers in `scripts/lora/3b/` share `lora-common.sh`. Configure its model
+and output paths on the server, and configure the dataset registry as above.
+The existing `sportsqa_sft.sh` entry point is unchanged.
+
+| Launcher | Fixed frames | Per-frame min pixels | Per-frame max pixels |
+| --- | ---: | ---: | ---: |
+| `lora-8f-448.sh` | 8 | 50176 | 200704 |
+| `lora-8f-634.sh` | 8 | 50176 | 401408 |
+| `lora-16f-448.sh` | 16 | 50176 | 200704 |
+| `lora-16f-634.sh` | 16 | 50176 | 401408 |
+
+`448` and `634` label pixel-area budgets, not forced square dimensions. Each
+profile has its own checkpoint directory under `checkpoints/<profile-name>`.
+Training uses `video_nframes` to pass `nframes` to `qwen-vl-utils`, exactly as
+the inference pipeline does. The processor does not sample or resize again,
+and no FPS is passed to the processor. Temporal positions therefore use the
+processor's default FPS (2.0 in Transformers 4.57.0), rather than the video's
+effective sampled FPS. The existing inference evaluator still supplies sampled
+FPS; its frame/pixel budget matches, but its temporal scale can differ.
+Videos with fewer original frames than requested fail explicitly.
+
+The profiles retain LoRA r=16/alpha=32/dropout=0.05, learning rate 1e-5,
+effective batch size 16 on one GPU, and 3 epochs. Their sequence limit is 8192
+to accommodate the 16-frame high-pixel profile plus text. Samples exceeding
+the limit or without answer labels fail instead of being silently truncated.
+
+```bash
+bash scripts/lora/3b/lora-8f-448.sh
+bash scripts/lora/3b/lora-8f-634.sh
+bash scripts/lora/3b/lora-16f-448.sh
+bash scripts/lora/3b/lora-16f-634.sh
+```
+
+Use the same launcher with `--eval` to pass its exact video budget to the
+existing deterministic evaluator. Configure that evaluator's prepared/video/
+output paths on the server, including videos for the selected split.
+
+```bash
+bash scripts/lora/3b/lora-16f-634.sh --eval \
+  /data/sportsqa/output/checkpoints/lora-16f-634/checkpoint-1000 val
+```
+
+The split defaults to `val`; use `test` only after checkpoint selection.
+This option runs exact scoring, not the separate LLM judge. If using the
+judge workflow, select its matching frame/pixel profile and the same
+`video_min_pixels=50176` explicitly.
+
+### Existing multi-model launchers
+
 Edit the training values at the top of `scripts/sportsqa_sft.sh`, then launch
 the model-specific wrapper:
 
