@@ -43,11 +43,9 @@ def candidate_frame_indices(total_frames: int, source_fps: float, candidate_fps:
 
 
 def _smooth(scores: np.ndarray, radius: int, sigma: float) -> np.ndarray:
-    if scores.size < 2 or radius <= 0:
-        return scores.copy()
     offsets = np.arange(-radius, radius + 1, dtype=np.float32)
     kernel = np.exp(-(offsets**2) / (2 * sigma**2))
-    kernel /= kernel.sum()
+    kernel /= np.sqrt(2 * np.pi) * sigma
     return np.convolve(np.pad(scores, (radius, radius), mode="edge"), kernel, mode="valid")
 
 

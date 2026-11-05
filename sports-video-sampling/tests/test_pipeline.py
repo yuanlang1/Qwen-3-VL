@@ -88,6 +88,9 @@ def test_sampling_parameters_create_separate_outputs_and_reuse_scores(tmp_path, 
     rows = load_selections(pipeline.selection_path(args))
     assert rows["0"]["sampling_types"].count("fast") == 4
     assert rows["0"]["selection"]["gaussian_sigma"] == 2
+    assert rows["0"]["selection"]["gaussian_normalization"] == "continuous"
+    config_path = pipeline.selection_path(args).with_suffix(".config.json")
+    assert json.loads(config_path.read_text(encoding="utf-8"))["config"]["gaussian_normalization"] == "continuous"
     assert len(rows["0"]["selected_queries"]) == 3
     assert len(list((tmp_path / "output" / "selections").glob("*.jsonl"))) == 2
     assert counts["generate"] == 2 and counts["encode"] == 1

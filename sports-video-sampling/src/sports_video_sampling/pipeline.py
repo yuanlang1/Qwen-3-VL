@@ -234,6 +234,7 @@ def _selection_config(args: Any) -> dict[str, Any]:
     return {
         "pipeline_version": PIPELINE_VERSION, "stage": "select",
         "scores_sha256": file_sha256(_score_path(args)),
+        "gaussian_normalization": "continuous",
         "num_queries": args.num_queries, "frame_budget": args.frame_budget,
         "alpha": args.alpha, "gaussian_radius": args.gaussian_radius,
         "gaussian_sigma": args.gaussian_sigma, "fast_ratio": args.fast_ratio,
@@ -285,7 +286,7 @@ def run_select(args: Any) -> StageSummary:
                     **record.to_dict(), **bank,
                     "resolved_video": row.get("resolved_video", row["video"]),
                     "decoder": row.get("decoder"), "source_video": row["source_video"],
-                    "selection": {key: config[key] for key in ("num_queries", "frame_budget", "alpha", "gaussian_radius", "gaussian_sigma", "fast_ratio")},
+                    "selection": {key: config[key] for key in ("num_queries", "frame_budget", "alpha", "gaussian_radius", "gaussian_sigma", "fast_ratio", "gaussian_normalization")},
                     "selected_queries": queries, "candidate_count": len(indices),
                     "selected_frame_indices": selected.frame_indices,
                     "selected_timestamps": [timestamp_by_index[index] for index in selected.frame_indices],

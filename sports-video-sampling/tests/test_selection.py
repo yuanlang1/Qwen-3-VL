@@ -35,3 +35,25 @@ def test_flat_scores_and_short_candidate_pool_are_deterministic_and_ordered():
     assert first.frame_indices == list(range(0, 90, 10))
     assert first.sampling_types.count("slow") == 7
     assert first.sampling_types.count("fast") == 2
+
+
+def test_continuous_gaussian_matches_explicit_formula_at_edges():
+    from sports_video_sampling.selection import _smooth
+    scores = np.asarray([0.2, 0.8, 0.1, 0.5], dtype=np.float32)
+    radius, sigma = 1, 2.0
+    expected = [sum(float(scores[min(max(i + j, 0), len(scores) - 1)])
+                    * np.exp(-j*j/(2*sigma*sigma))
+                    / (np.sqrt(2*np.pi)*sigma)
+                    for j in range(-radius, radius+1)) for i in range(len(scores))]
+    np.testing.assert_allclose(_smooth(scores, radius, sigma), expected, rtol=1e-6)
+    assert not np.isclose(_smooth(np.ones(4), radius, sigma)[1], 1.0)
+
+
+def test_continuous_gaussian_zero_radius_and_single_score():
+    from sports_video_sampling.selection import _smooth
+    scores = np.asarray([1.0, 2.0])
+    np.testing.assert_allclose(_smooth(scores, 0, 2.0), scores / (np.sqrt(2*np.pi)*2))
+    sigma, radius = 1.5, 2
+    expected = 3 * sum(np.exp(-j*j/(2*sigma*sigma)) / (np.sqrt(2*np.pi)*sigma)
+                       for j in range(-radius, radius+1))
+    np.testing.assert_allclose(_smooth(np.asarray([3.0]), radius, sigma), [expected], rtol=1e-6)
