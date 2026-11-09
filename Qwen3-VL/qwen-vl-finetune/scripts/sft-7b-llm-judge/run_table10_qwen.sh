@@ -1,0 +1,221 @@
+#!/bin/bash
+
+set -euo pipefail
+
+REAL_NVIDIA_DRIVER=/tmp/real-nvidia-driver
+
+mkdir -p "$REAL_NVIDIA_DRIVER"
+
+ln -sfn \
+    /usr/lib64/libcuda.so.570.133.20 \
+    "$REAL_NVIDIA_DRIVER/libcuda.so.1"
+
+ln -sfn \
+    /usr/lib64/libcuda.so.570.133.20 \
+    "$REAL_NVIDIA_DRIVER/libcuda.so"
+
+export LD_LIBRARY_PATH="$REAL_NVIDIA_DRIVER:${LD_LIBRARY_PATH:-}"
+
+
+# Sports-QA inference uses PyTorch only. Avoid importing a TensorFlow build that
+# may be incompatible with the server image's NumPy/CUDA runtime.
+export USE_TF=0
+export USE_TORCH=1
+
+if [ "${1:-}" = "--judge-only" ]; then
+    if [ "$#" -ne 2 ]; then
+        echo "Usage: bash scripts/sft-7b-llm-judge/run_table10_qwen.sh --judge-only RUN_NAME" >&2
+        exit 2
+    fi
+    judge_only=true
+    model=
+    run_name=$2
+    adapter_path=
+elif [ "$#" -ge 2 ] && [ "$#" -le 3 ]; then
+    judge_only=false
+    model=$1
+    run_name=$2
+    adapter_path=${3:-}
+else
+    echo "Usage: bash scripts/sft-7b-llm-judge/run_table10_qwen.sh MODEL RUN_NAME [ADAPTER_PATH]" >&2
+    echo "   or: bash scripts/sft-7b-llm-judge/run_table10_qwen.sh --judge-only RUN_NAME" >&2
+    exit 2
+fi
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+project_root=$(CDPATH= cd -- "${script_dir}/../.." && pwd)
+judge_dir=${project_root}/tools/sportsqa-qwen-llm-judge
+
+# Set QWEN_API_KEY in the environment before running Judge.
+if [ -z "${QWEN_API_KEY:-}" ]; then
+    echo "Please set QWEN_API_KEY before running Judge." >&2
+    exit 2
+fi
+export QWEN_API_KEY
+
+# Replace these explicit placeholders before running on the server.
+prepared_root=/home/user/data/sportsqa_prepared
+video_root=/home/user/data/export_test
+output_root=${project_root}/../data/qwen2.5-vl
+
+required_paths=("${prepared_root}" "${output_root}")
+if [ "${judge_only}" = false ]; then
+    required_paths+=("${video_root}")
+fi
+for configured_path in "${required_paths[@]}"; do
+    if [[ "${configured_path}" == PATH_TO_* ]]; then
+        echo "Replace Sports-QA path placeholders in ${script_dir}/run_table10_qwen.sh." >&2
+        exit 2
+    fi
+done
+
+# Yang-style Qwen inference profile. The paper does not disclose video sampling;
+# freeze this documented profile rather than selecting it on the test set.
+split=test
+# GPU generation parameters. batch_size does not change DataLoader task size.
+batch_size=8
+max_new_tokens=320
+
+# Video sampling parameters
+video_frames=${SPORTSQA_VIDEO_FRAMES:-8}
+video_min_pixels=${SPORTSQA_VIDEO_MIN_PIXELS:-50176}
+video_max_pixels=${SPORTSQA_VIDEO_MAX_PIXELS:-200704}
+prompt_style=yang-0s
+sample_num=${SPORTSQA_SAMPLE_NUM:-0}
+profile_suffix=${SPORTSQA_EVAL_PROFILE:+_${SPORTSQA_EVAL_PROFILE}}
+
+if ! [[ "${sample_num}" =~ ^[0-9]+$ ]]; then
+    echo "sample_num must be a non-negative integer (0 means all samples)." >&2
+    exit 2
+fi
+
+# CPU DataLoader/decoder parameters. Each prefetched item is one decoded video group.
+video_backend=torchcodec
+decoder_threads=2
+num_workers=4
+prefetch_factor=2
+persistent_workers=false
+
+# Main-process processor/H2D parameters
+use_fast_processor=true
+pin_memory=true
+timeout=120
+multiprocessing_context=spawn
+
+# SiliconFlow semantic judge. RPM and TPM limits apply independently to each account.
+judge_model=qwen3.7-flash-2026-07-15
+judge_max_tokens=128
+judge_timeout_seconds=240
+judge_max_in_flight_batches=10
+
+# Qianwen account ceilings. The judge uses 80% of these ceilings so
+# unrelated calls on the same account retain headroom.
+judge_rate_limit_rpm=30000
+judge_rate_limit_tpm=5000000
+judge_rate_limit_safety_factor=0.8
+judge_max_attempts=8
+judge_retry_backoff_seconds=15
+judge_max_retry_backoff_seconds=300
+
+judge_tag=${SPORTSQA_JUDGE_TAG-qwen3.7-flash-2026-07-15}
+if [ -n "${judge_tag}" ]; then
+    run_root=${output_root}/judge/${judge_tag}/7b/${run_name}
+else
+    run_root=${output_root}/judge/7b/${run_name}
+fi
+prediction_file=${output_root}/infer/7b/${run_name}.jsonl
+exact_metric_file=${run_root}/metrics/${split}_${prompt_style}${profile_suffix}_exact.json
+exact_details_file=${run_root}/metrics/${split}_${prompt_style}${profile_suffix}_exact_details.jsonl
+judge_label=hybrid-rule-exact-yes-no-score-single
+judgment_file=${run_root}/judgments/${split}_${prompt_style}${profile_suffix}_${judge_label}.jsonl
+semantic_metric_file=${run_root}/metrics/${split}_${prompt_style}${profile_suffix}_${judge_label}.json
+manifest=${prepared_root}/${split}_manifest.json
+
+if [ "${judge_only}" = false ]; then
+    infer_args=(
+        --model-name-or-path "${model}"
+        --manifest "${manifest}"
+        --video-root "${video_root}"
+        --output-file "${prediction_file}"
+        --resume
+        --batch-size "${batch_size}"
+        --max-new-tokens "${max_new_tokens}"
+        --temperature 0
+        --video-frames "${video_frames}"
+        --video-min-pixels "${video_min_pixels}"
+        --video-max-pixels "${video_max_pixels}"
+        --video-backend "${video_backend}"
+        --decoder-threads "${decoder_threads}"
+        --prompt-style "${prompt_style}"
+        --num-workers "${num_workers}"
+        --prefetch-factor "${prefetch_factor}"
+        --timeout "${timeout}"
+        --multiprocessing-context "${multiprocessing_context}"
+    )
+    if [ -n "${adapter_path}" ]; then
+        infer_args+=(--adapter-path "${adapter_path}")
+    fi
+    if [ "${sample_num}" -gt 0 ]; then
+        infer_args+=(--limit "${sample_num}")
+    fi
+    if [ "${persistent_workers}" = true ]; then
+        infer_args+=(--persistent-workers)
+    fi
+    if [ "${pin_memory}" = false ]; then
+        infer_args+=(--no-pin-memory)
+    fi
+    if [ "${use_fast_processor}" = false ]; then
+        infer_args+=(--no-use-fast-processor)
+    fi
+
+    python "${project_root}/tools/infer_sportsqa.py" "${infer_args[@]}"
+elif [ ! -f "${prediction_file}" ]; then
+    echo "Cannot start judge-only mode: missing predictions at ${prediction_file}." >&2
+    exit 2
+fi
+
+exact_args=(
+    --manifest "${manifest}"
+    --predictions "${prediction_file}"
+    --answer-map "${prepared_root}/answer_to_id.json"
+    --output-file "${exact_metric_file}"
+    --details-file "${exact_details_file}"
+)
+if [ "${sample_num}" -gt 0 ]; then
+    exact_args+=(--limit "${sample_num}")
+fi
+python "${project_root}/tools/eval_sportsqa.py" "${exact_args[@]}" > /dev/null
+
+judge_args=(
+    --manifest "${manifest}"
+    --predictions "${prediction_file}"
+    --output-file "${judgment_file}"
+    --rule-details "${exact_details_file}"
+    --model "${judge_model}"
+    --temperature 0
+    --max-tokens "${judge_max_tokens}"
+    --timeout-seconds "${judge_timeout_seconds}"
+    --max-in-flight-batches "${judge_max_in_flight_batches}"
+    --rate-limit-rpm "${judge_rate_limit_rpm}"
+    --rate-limit-tpm "${judge_rate_limit_tpm}"
+    --rate-limit-safety-factor "${judge_rate_limit_safety_factor}"
+    --max-attempts "${judge_max_attempts}"
+    --retry-backoff-seconds "${judge_retry_backoff_seconds}"
+    --max-retry-backoff-seconds "${judge_max_retry_backoff_seconds}"
+    --resume
+)
+if [ "${sample_num}" -gt 0 ]; then
+    judge_args+=(--limit "${sample_num}")
+fi
+python "${judge_dir}/judge_sportsqa_semantic.py" "${judge_args[@]}"
+
+summary_args=(
+    --manifest "${manifest}"
+    --judgments "${judgment_file}"
+    --output-file "${semantic_metric_file}"
+    --require-complete
+)
+if [ "${sample_num}" -gt 0 ]; then
+    summary_args+=(--limit "${sample_num}")
+fi
+python "${judge_dir}/summarize_sportsqa_semantic.py" "${summary_args[@]}"

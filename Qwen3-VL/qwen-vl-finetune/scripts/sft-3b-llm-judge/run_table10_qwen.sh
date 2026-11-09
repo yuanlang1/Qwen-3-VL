@@ -2,6 +2,21 @@
 
 set -euo pipefail
 
+REAL_NVIDIA_DRIVER=/tmp/real-nvidia-driver
+
+mkdir -p "$REAL_NVIDIA_DRIVER"
+
+ln -sfn \
+    /usr/lib64/libcuda.so.570.133.20 \
+    "$REAL_NVIDIA_DRIVER/libcuda.so.1"
+
+ln -sfn \
+    /usr/lib64/libcuda.so.570.133.20 \
+    "$REAL_NVIDIA_DRIVER/libcuda.so"
+
+export LD_LIBRARY_PATH="$REAL_NVIDIA_DRIVER:${LD_LIBRARY_PATH:-}"
+
+
 # Sports-QA inference uses PyTorch only. Avoid importing a TensorFlow build that
 # may be incompatible with the server image's NumPy/CUDA runtime.
 export USE_TF=0
@@ -31,19 +46,17 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_root=$(CDPATH= cd -- "${script_dir}/../.." && pwd)
 judge_dir=${project_root}/tools/sportsqa-qwen-llm-judge
 
-# Add accounts to this list only in the server-local copy. Do not commit real tokens.
-# All accounts must use the same SiliconFlow endpoint and judge model.
-judge_account_pool_json='[{"id":"siliconflow-1","api_key":"YOUR_SILICONFLOW_API_KEY"}]'
-if [[ "${judge_account_pool_json}" == *'YOUR_SILICONFLOW_API_KEY'* ]]; then
-    echo "Set judge_account_pool_json in ${script_dir}/run_table10_qwen.sh before running this script." >&2
+# Set QWEN_API_KEY in the environment before running Judge.
+if [ -z "${QWEN_API_KEY:-}" ]; then
+    echo "Please set QWEN_API_KEY before running Judge." >&2
     exit 2
 fi
-export SILICONFLOW_ACCOUNT_POOL_JSON="${judge_account_pool_json}"
+export QWEN_API_KEY
 
 # Replace these explicit placeholders before running on the server.
 prepared_root=/home/user/data/sportsqa_prepared
 video_root=/home/user/data/export_test
-output_root=/home/user/data/sportsqa_output/qwen2.5-vl
+output_root=${project_root}/../data/qwen2.5-vl
 
 required_paths=("${prepared_root}" "${output_root}")
 if [ "${judge_only}" = false ]; then
@@ -60,8 +73,8 @@ done
 # freeze this documented profile rather than selecting it on the test set.
 split=test
 # GPU generation parameters. batch_size does not change DataLoader task size.
-batch_size=1
-max_new_tokens=32
+batch_size=32
+max_new_tokens=320
 
 # Video sampling parameters
 video_frames=${SPORTSQA_VIDEO_FRAMES:-8}
@@ -90,21 +103,26 @@ timeout=120
 multiprocessing_context=spawn
 
 # SiliconFlow semantic judge. RPM and TPM limits apply independently to each account.
-judge_model=deepseek-ai/DeepSeek-V3
-judge_max_tokens=4096
+judge_model=qwen3.7-flash-2026-07-15
+judge_max_tokens=128
 judge_timeout_seconds=240
-judge_max_in_flight_batches=4
-# SiliconFlow L0 account ceilings. The judge uses 80% of these ceilings so
+judge_max_in_flight_batches=10
+# Qianwen account ceilings. The judge uses 80% of these ceilings so
 # unrelated calls on the same account retain headroom.
-judge_rate_limit_rpm=1000
-judge_rate_limit_tpm=50000
+judge_rate_limit_rpm=30000
+judge_rate_limit_tpm=5000000
 judge_rate_limit_safety_factor=0.8
 judge_max_attempts=8
 judge_retry_backoff_seconds=15
 judge_max_retry_backoff_seconds=300
 
-run_root=${output_root}/${run_name}
-prediction_file=${run_root}/predictions/${split}_${prompt_style}${profile_suffix}.jsonl
+judge_tag=${SPORTSQA_JUDGE_TAG-qwen3.7-flash-2026-07-15}
+if [ -n "${judge_tag}" ]; then
+    run_root=${output_root}/judge/${judge_tag}/${run_name}
+else
+    run_root=${output_root}/judge/${run_name}
+fi
+prediction_file=${output_root}/infer/${run_name}.jsonl
 exact_metric_file=${run_root}/metrics/${split}_${prompt_style}${profile_suffix}_exact.json
 exact_details_file=${run_root}/metrics/${split}_${prompt_style}${profile_suffix}_exact_details.jsonl
 judge_label=hybrid-rule-exact-yes-no-score-single

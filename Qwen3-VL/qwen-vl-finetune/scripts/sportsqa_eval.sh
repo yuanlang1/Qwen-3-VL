@@ -18,11 +18,10 @@ batch_size=1
 max_new_tokens=32
 
 # Video sampling parameters
-# Optional arguments 5-7 let the LoRA launchers reuse their training budget.
-video_frames=${5:-8}
-video_min_pixels=${7:-50176}
-video_max_pixels=${6:-200704}
-sample_num=0
+video_frames=8
+video_min_pixels=50176
+video_max_pixels=200704
+max_samples=0
 
 # CPU DataLoader/decoder parameters. Each prefetched item is one decoded video group.
 video_backend=torchcodec
@@ -77,8 +76,8 @@ infer_args="
 if [ -n "${adapter_path}" ]; then
     infer_args="${infer_args} --adapter-path ${adapter_path}"
 fi
-if [ "${sample_num}" -gt 0 ]; then
-    infer_args="${infer_args} --limit ${sample_num}"
+if [ "${max_samples}" -gt 0 ]; then
+    infer_args="${infer_args} --limit ${max_samples}"
 fi
 if [ "${persistent_workers}" = true ]; then
     infer_args="${infer_args} --persistent-workers"
@@ -100,8 +99,8 @@ eval_args="
     --output-file ${metric_file} \
     --details-file ${details_file}"
 
-if [ "${sample_num}" -gt 0 ]; then
-    eval_args="${eval_args} --limit ${sample_num}"
+if [ "${max_samples}" -gt 0 ]; then
+    eval_args="${eval_args} --limit ${max_samples}"
 fi
 
 python tools/eval_sportsqa.py ${eval_args}

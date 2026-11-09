@@ -2,6 +2,21 @@
 
 set -euo pipefail
 
+REAL_NVIDIA_DRIVER=/tmp/real-nvidia-driver
+
+mkdir -p "$REAL_NVIDIA_DRIVER"
+
+ln -sfn \
+    /usr/lib64/libcuda.so.570.133.20 \
+    "$REAL_NVIDIA_DRIVER/libcuda.so.1"
+
+ln -sfn \
+    /usr/lib64/libcuda.so.570.133.20 \
+    "$REAL_NVIDIA_DRIVER/libcuda.so"
+
+export LD_LIBRARY_PATH="$REAL_NVIDIA_DRIVER:${LD_LIBRARY_PATH:-}"
+
+
 # This runner writes only Sports-QA predictions. It never invokes exact scoring,
 # the LLM judge, or reads SILICONFLOW_API_KEY.
 export USE_TF=0
@@ -22,14 +37,14 @@ project_root=$(CDPATH= cd -- "${script_dir}/../.." && pwd)
 # Server-local Sports-QA paths.
 prepared_root=/home/user/data/sportsqa_prepared
 video_root=/home/user/data/export_test
-output_root=/home/user/data/sportsqa_output/qwen2.5-vl
+output_root=${project_root}/../data/qwen2.5-vl/infer
 
 split=test
 
 # GPU generation parameters. batch_size does not change DataLoader task size.
-# Start conservatively in a memory-limited Pod; increase only after a full run.
-batch_size=2
-max_new_tokens=32
+# Match the 3B full-evaluation GPU batch configuration.
+batch_size=${SPORTSQA_BATCH_SIZE:-32}
+max_new_tokens=320
 
 # Video sampling parameters.
 video_frames=${SPORTSQA_VIDEO_FRAMES:-8}
@@ -37,7 +52,6 @@ video_min_pixels=${SPORTSQA_VIDEO_MIN_PIXELS:-50176}
 video_max_pixels=${SPORTSQA_VIDEO_MAX_PIXELS:-200704}
 prompt_style=yang-0s
 sample_num=${SPORTSQA_SAMPLE_NUM:-0}
-profile_suffix=${SPORTSQA_EVAL_PROFILE:+_${SPORTSQA_EVAL_PROFILE}}
 
 if ! [[ "${sample_num}" =~ ^[0-9]+$ ]]; then
     echo "sample_num must be a non-negative integer (0 means all samples)." >&2
@@ -46,15 +60,15 @@ fi
 
 # CPU DataLoader/decoder parameters. Each prefetched item is one decoded video group.
 # Switch to torchcodec after it is installed and verified on the server.
-video_backend=torchvision
+video_backend=torchcodec
 decoder_threads=2
-num_workers=1
-prefetch_factor=1
+num_workers=4
+prefetch_factor=2
 persistent_workers=false
 
 # Main-process processor/H2D parameters.
 use_fast_processor=true
-pin_memory=false
+pin_memory=true
 timeout=120
 multiprocessing_context=spawn
 
@@ -65,7 +79,7 @@ for required_path in "${model}" "${prepared_root}" "${video_root}"; do
     fi
 done
 
-prediction_file=${output_root}/${run_name}/predictions/${split}_${prompt_style}${profile_suffix}.jsonl
+prediction_file=${output_root}/${run_name}.jsonl
 
 infer_args=(
     --model-name-or-path "${model}"

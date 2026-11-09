@@ -222,7 +222,22 @@ class QueryBankGenerator:
         for query in queries:
             if len(re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", query)) > 20:
                 raise ValueError(f"Query exceeds 20 words: {query}")
-        return {"sport_type": sport_type, "sport_type_confidence": confidence, "query_bank": queries}
+        nouns = data.get("focus_nouns")
+        if not isinstance(nouns, list) or not 2 <= len(nouns) <= 8:
+            raise ValueError("focus_nouns must contain 2 to 8 noun phrases")
+        if any(not isinstance(noun, str) or not noun.strip() for noun in nouns):
+            raise ValueError("focus_nouns must contain non-empty strings")
+        nouns = [noun.strip() for noun in nouns]
+        normalized_nouns = {" ".join(noun.lower().split()) for noun in nouns}
+        if len(normalized_nouns) != len(nouns):
+            raise ValueError("focus_nouns contains duplicate phrases")
+        for noun in nouns:
+            if not 1 <= len(re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", noun)) <= 4:
+                raise ValueError(f"Each focus_nouns phrase must contain 1 to 4 English words: {noun}")
+        return {
+            "sport_type": sport_type, "sport_type_confidence": confidence,
+            "query_bank": queries, "focus_nouns": nouns,
+        }
 
     def generate_from_previews(
         self, question: str, previews: list[Any], preview_indices: list[int]

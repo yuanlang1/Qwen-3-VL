@@ -54,9 +54,10 @@ def main():
         fail_four = True
 
         def fake_completion(endpoint, api_key, model, user_content, temperature, max_tokens, timeout_seconds):
-            assert user_content.count("qa_id: ") == 1
-            qa_id = user_content.splitlines()[0].split(": ", 1)[1]
-            assert qa_id in {"3", "4"}, "Rule decisions must not call the API"
+            assert "qa_id:" not in user_content
+            prediction = user_content.split("Predicted Answer: ", 1)[1].split("\n\nProvide your evaluation", 1)[0]
+            assert prediction in {"There are two players.", "unclear"}, "Rule decisions must not call the API"
+            qa_id = "3" if prediction == "There are two players." else "4"
             with lock:
                 counts[qa_id] += 1
                 attempt = counts[qa_id]
@@ -64,13 +65,13 @@ def main():
                 concurrent_requests.wait()
             if qa_id == "4" and fail_four:
                 raise ValueError("simulated response failure")
-            value = {"qa_id": qa_id, "pred": "yes" if qa_id == "3" else "no",
+            value = {"pred": "yes" if qa_id == "3" else "no",
                      "score": 4.5 if qa_id == "3" else 0}
-            return json.dumps({"judgments": [value]}), {"total_tokens": 1}
+            return json.dumps(value), {"total_tokens": 1}
 
-        pool = judge.AccountPool([judge.JudgeAccount("offline", "unused")], 10**12, 10**12, 1)
+        pool = judge.RateLimiter("unused", 10**12, 10**12, 1)
         with patch.object(judge, "call_chat_completion", side_effect=fake_completion):
-            with patch.object(judge, "account_pool_for_pending_judgments", return_value=pool):
+            with patch.object(judge, "rate_limiter_for_pending_judgments", return_value=pool):
                 run_main(judge, arguments)
                 assert counts == {"3": 1, "4": 2}, counts
                 rows = judge.load_jsonl(root / "judgments.jsonl")
@@ -121,6 +122,14 @@ def main():
                     assert error.code == 2
                 else:
                     raise AssertionError("Judge batch size must no longer be configurable")
+
+        assert judge.PROMPT_VERSION == "yang-video-semantic-single-v6-yes-no-score"
+        for response in [
+            {"pred": "yes", "score": 4.5},
+            {"judgments": [{"pred": "yes", "score": 4.5}]},
+            {"judgments": [{"qa_id": "3", "pred": "yes", "score": 4.5}]},
+        ]:
+            assert judge.parse_judgments(json.dumps(response), ["3"]) == {"3": (True, 4.5)}
 
         for values in [[], [{"qa_id": "wrong", "pred": "yes", "score": 5}],
                        [{"qa_id": "3", "pred": "yes", "score": 5}] * 2,

@@ -38,14 +38,15 @@ JSON 数组或 JSONL，每条包含：
 | `sport_type_confidence` | high / medium / low，unknown 必须为 low |
 | `sport_type_source` | preview_inference |
 | `query_bank` | 恰好七条、非空、互不重复的英文查询，按重要性排序 |
+| `focus_nouns` | 必填，2～8 条非空、互不重复的英文名词短语，每条最多 4 个英文词，按重要性排序 |
 | `preview_frame_indices` | 按时间排序的原视频预览帧索引 |
 | `query_generator` | 查询模型名称 |
 
-单独提供外部查询文件时，也必须包含标准字段及合法的 sport_type、sport_type_confidence、query_bank。
+单独提供外部查询文件时，也必须包含标准字段及合法的 `sport_type`、`sport_type_confidence`、`query_bank`、`focus_nouns`。
 
 ## 分数产物
 
-`scores.jsonl` 保留查询记录，并增加：
+`scores.jsonl` 保留查询记录及 `focus_nouns`。CLIP 只对 `query_bank` 打分。新增字段如下。
 
 - `decoder`: 固定为 decord，表示索引和时间戳来源。
 - `source_video`: total_frames、average_fps。
@@ -57,7 +58,7 @@ JSON 数组或 JSONL，每条包含：
 
 ## 选帧产物
 
-保留标准字段、运动类型、query_bank、resolved_video、source_video、decoder，并包含：
+选帧产物保留标准字段、运动类型、`query_bank`、`focus_nouns`、`resolved_video`、`source_video` 和 `decoder`，并包含以下字段。
 
 | 字段 | 说明 |
 | --- | --- |

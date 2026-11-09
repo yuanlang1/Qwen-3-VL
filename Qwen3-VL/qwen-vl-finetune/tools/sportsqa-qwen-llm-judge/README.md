@@ -13,20 +13,16 @@ reproduction of Yang et al., which used GPT-4 as the judge. Keep the metric file
 
 ## Setup
 
-Run from `qwen-vl-finetune`. Configure the three server-local paths and `judge_account_pool_json`
-near the top of `scripts/sft-3b-llm-judge/run_table10_qwen.sh`:
-
-The default pool contains one account. Add objects with distinct `id` values to use more
-accounts; every account must use the same SiliconFlow endpoint and judge model. Replace
-tokens only in the server-local script and do not commit them. Tokens are not accepted on
-the command line or stored in prediction, judgment, or metric artifacts.
-
+Run from `qwen-vl-finetune`. Both 3B and 7B runners require one API key:
 ```bash
-judge_account_pool_json='[
-  {"id":"siliconflow-1","api_key":"TOKEN_1"},
-  {"id":"siliconflow-2","api_key":"TOKEN_2"}
-]'
+source /root/.config/qwen-judge/api.env
+bash scripts/sft-3b-llm-judge/eval-3b-8f-448.sh --judge-only 3b-8f-448-test
 ```
+The server-local credential file has mode 600. Alternatively export QWEN_API_KEY
+in the shell. No account pool or account rotation is supported. Threads share
+one process-local RPM/TPM limiter and 429 cooldown. HTTP 401/403 stops the run;
+RemoteDisconnected follows the configured retry policy. Run 3B and 7B sequentially
+when sharing the same account. Existing judgments and resume protocol are unchanged.
 
 ## Runs
 
@@ -140,16 +136,14 @@ Evaluate the Question, Correct Answer, and Predicted Answer. Return
 otherwise return "no". Score the match from 0 to 5; decimal scores are allowed.
 
 Return exactly one JSON object with this schema:
-{"judgments": [{"qa_id": "123", "pred": "yes", "score": 4.8}]}
+{"pred": "yes", "score": 4.8}
 
-The "judgments" array must contain exactly one judgment, with the same qa_id as the
-input. Do not include Markdown or any text outside the JSON object.
+Do not include an ID, Markdown, or any text outside the JSON object.
 ```
 
 The user message contains exactly one QA:
 
 ```text
-qa_id: {qa_id}
 Question: {question}
 Correct Answer: {answer}
 Predicted Answer: {prediction_raw}
@@ -207,3 +201,25 @@ silent. During hybrid scoring, the terminal shows the `Hybrid semantic judging`
 progress bar. On complete success, the final console JSON contains only `count`, `correct`,
 and `accuracy`; consult the semantic metric file for question-type accuracies and average
 semantic score.
+
+
+The server single-QA request/response no longer carries a QA ID. The model returns
+only `pred` and `score`; the program binds the response to the request's original
+QA ID. Stored judgment fields, prediction hashes and prompt version are unchanged
+for resume compatibility. Legacy responses containing a QA ID are still accepted
+only when that ID matches. Existing successful judgments are skipped on resume.
+
+## Current system prompt
+
+```text
+You are an intelligent chatbot designed for evaluating the correctness of generative outputs for question-answer pairs.
+
+Your task is to compare the predicted answer with the correct answer and determine if they match meaningfully.
+
+Here's how you can accomplish the task:
+
+## INSTRUCTIONS:
+- Focus on the meaningful match between the predicted answer and the correct answer.
+- Consider synonyms or paraphrases as valid matches.
+- Evaluate the correctness of the prediction compared to the answer.
+```

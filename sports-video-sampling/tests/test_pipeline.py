@@ -36,7 +36,7 @@ def setup_pipeline(tmp_path, monkeypatch):
     def generate(self, question, previews, indices):
         counts["generate"] += 1
         assert "SECRET" not in question
-        return {"sport_type": "basketball", "sport_type_confidence": "high", "query_bank": [f"{question} evidence {index}" for index in range(7)], "preview_frame_indices": indices}
+        return {"sport_type": "basketball", "sport_type_confidence": "high", "query_bank": [f"{question} evidence {index}" for index in range(7)], "focus_nouns": ["basketball", "shooter"], "preview_frame_indices": indices}
 
     class Scorer:
         torch = SimpleNamespace(from_numpy=Tensor)
@@ -74,6 +74,7 @@ def test_all_is_per_question_cached_resumable_and_independent_of_dataset(tmp_pat
     assert set(selections) == {"0", "1"}
     assert selections["0"]["selected_frame_indices"] != selections["1"]["selected_frame_indices"]
     assert selections["0"]["metadata"]["split"] == "challenge"
+    assert selections["0"]["focus_nouns"] == ["basketball", "shooter"]
     main(["all", *base])
     assert counts == {"previews": 1, "encode": 1, "generate": 2}
     main(["scores", "--video-root", str(tmp_path), "--output-dir", str(tmp_path / "output"), "--overwrite"])
